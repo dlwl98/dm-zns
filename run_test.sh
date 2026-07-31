@@ -5,6 +5,8 @@ DM_NAME="my-m1-device"
 UNDERLYING="/dev/nullb0"
 MOD_NAME="dm-zns-base"
 
+sudo dmsetup remove "$DM_NAME" 2>/dev/null || true
+
 if [ -f "scripts/nullblk-down.sh" ]; then
     sudo bash scripts/nullblk-down.sh
 fi
