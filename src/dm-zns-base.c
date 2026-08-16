@@ -113,6 +113,26 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	for (i = 0; i < c->total_blocks; i++)
 		c->mapping_table[i] = PBA_UNMAPPED;
 
+	/*
+	 * 하위 디바이스의 zone 을 전부 reset 해 wp 를 0 으로 맞춘다.
+	 *
+	 * 매핑 테이블이 in-memory 라 dtr 에서 통째로 사라진다. 즉 타깃을 새로
+	 * 붙이는 시점에 하위에 남아 있던 데이터는 어차피 도달할 수 없다.
+	 * 지워도 잃을 것이 없고, 대신 nullb0 를 살려둔 채 타깃만 재생성해도
+	 * wp_offset(0) 과 하위의 실제 wp 가 어긋나지 않는다.
+	 *
+	 * 매핑 영속화(stretch)를 하게 되면 이 결정을 되돌려야 한다.
+	 */
+	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, 0,
+			       bdev_nr_sectors(c->dev->bdev));
+	if (ret) {
+		ti->error = "failed to reset zones on underlying device";
+		kvfree(c->mapping_table);
+		dm_put_device(ti, c->dev);
+		kfree(c);
+		return ret;
+	}
+
 	ti->private          = c;
 	ti->num_flush_bios   = 1;
 	ti->num_discard_bios = 1;
@@ -195,6 +215,21 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 	/* ---- 매핑 테이블 갱신 (atomic하게) ---- */
 	spin_lock_irqsave(&c->map_lock, flags);
 
+	/*
+	 * GC 가 없으므로(M3) 한 번 전진한 wp 는 되돌아오지 않는다.
+	 * 용량을 넘기면 조용히 디바이스 밖으로 나가는 대신 여기서 끊는다.
+	 */
+	if (c->wp_offset + len_sectors > c->total_sectors) {
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		DMERR_LIMIT("out of space: wp=%llu + %llu > %llu (GC 미구현 — M3)",
+			    (unsigned long long)c->wp_offset,
+			    (unsigned long long)len_sectors,
+			    (unsigned long long)c->total_sectors);
+		bio->bi_status = BLK_STS_NOSPC;
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
+
 	pba = c->wp_offset; /* 이 요청이 실제로 기록될 ZNS상의 시작 섹터 */
 
 	for (i = 0; i < nr_blocks; i++) {
@@ -243,13 +278,33 @@ err_io:
  * Read I/O — 매핑 테이블 lookup 후 remapping 또는 zero-fill
  * ================================================================== */
 
+/*
+ * 매핑은 4 KiB 블록 단위인데 bio 는 그보다 크다 (readahead 는 흔히 128 KiB).
+ * 그리고 임의 쓰기로 만들어진 매핑이라 인접한 논리 블록이 물리적으로도
+ * 인접하다는 보장이 전혀 없다.
+ *
+ * 따라서 요청 전체를 첫 블록의 PBA 로 remap 하면 안 된다 — 첫 블록만 맞고
+ * 나머지는 다른 LBA 의 데이터가 돌아온다. M1 의 성공 기준(fio randwrite 의
+ * blk_update_request delta)은 읽기를 아예 하지 않으므로 이 결함을 잡지 못한다.
+ *
+ * PBA 가 연속으로 이어지는 구간(run)만큼만 처리하고, 남는 부분은
+ * dm_accept_partial_bio() 로 DM 에 돌려줘 .map 이 다시 불리게 한다.
+ */
 static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 {
-	struct zns_base_c *c = ti->private;
-	sector_t lba         = bio->bi_iter.bi_sector;
-	sector_t block_idx   = lba >> BLOCK_SHIFT;
-	sector_t pba;
+	struct zns_base_c *c  = ti->private;
+	sector_t lba          = bio->bi_iter.bi_sector;
+	sector_t block_idx    = lba >> BLOCK_SHIFT;
+	sector_t off_in_block = lba & (SECTORS_PER_BLOCK - 1);
+	sector_t want         = bio_sectors(bio);
+	sector_t run, pba;
+	sector_t i = 1;
 	unsigned long flags;
+
+	if (want == 0) {
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
 
 	spin_lock_irqsave(&c->map_lock, flags);
 
@@ -257,21 +312,39 @@ static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 		? c->mapping_table[block_idx]
 		: PBA_UNMAPPED;
 
+	/*
+	 * 첫 블록에서 쓸 수 있는 만큼으로 시작해, 뒤따르는 블록이 PBA 상
+	 * 연속인 동안 구간을 늘린다. 매핑이 없는 블록끼리도 묶어서 한 번에
+	 * zero-fill 한다.
+	 */
+	run = SECTORS_PER_BLOCK - off_in_block;
+	while (run < want && block_idx + i < c->total_blocks) {
+		sector_t next = c->mapping_table[block_idx + i];
+
+		if (pba == PBA_UNMAPPED) {
+			if (next != PBA_UNMAPPED)
+				break;
+		} else if (next != pba + (i << BLOCK_SHIFT)) {
+			break;
+		}
+
+		run += SECTORS_PER_BLOCK;
+		i++;
+	}
+
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
-	if (pba != PBA_UNMAPPED) {
-		/*
-		 * LBA 내의 섹터 오프셋을 PBA에 반영한다.
-		 * 블록 정렬되지 않은 읽기도 처리.
-		 */
-		sector_t sector_in_block = lba & (SECTORS_PER_BLOCK - 1);
+	/* 연속 구간이 요청보다 짧으면 그만큼만 받는다. 나머지는 DM 이 다시 부른다. */
+	if (run < want)
+		dm_accept_partial_bio(bio, (unsigned int)run);
 
+	if (pba != PBA_UNMAPPED) {
 		bio_set_dev(bio, c->dev->bdev);
-		bio->bi_iter.bi_sector = pba + sector_in_block;
+		bio->bi_iter.bi_sector = pba + off_in_block;
 		return DM_MAPIO_REMAPPED;
 	}
 
-	/* 아직 쓰인 적 없는 블록 → 0으로 채워서 즉시 완료 */
+	/* 아직 쓰인 적 없는 구간 → 0으로 채워서 즉시 완료 */
 	zero_fill_bio(bio);
 	bio->bi_status = BLK_STS_OK;
 	bio_endio(bio);
