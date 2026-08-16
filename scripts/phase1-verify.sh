@@ -107,7 +107,6 @@ echo "    sudo dmsetup table $DM_NAME"
 echo "    sudo blkzone report $UNDERLYING | head -3"
 echo "    sudo dmesg | grep zns-base | tail"
 echo
-echo "  정리할 때 (순서 지킬 것):"
-echo "    sudo dmsetup remove $DM_NAME && sudo rmmod $MOD_NAME && sudo bash scripts/nullblk-down.sh"
+echo "  정리:  sudo bash scripts/teardown.sh"
 
 exit $fail

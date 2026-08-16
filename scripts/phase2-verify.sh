@@ -148,6 +148,6 @@ step "결과"
 echo "  통과 $pass / 실패 $fail"
 [ $fail -eq 0 ] && echo "  >>> PHASE 2 PASSED <<<" || echo "  >>> 실패 항목 있음 <<<"
 echo
-echo "  정리:  sudo dmsetup remove $DM_NAME && sudo rmmod $MOD_NAME && sudo bash scripts/nullblk-down.sh"
+echo "  정리:  sudo bash scripts/teardown.sh"
 
 exit $fail

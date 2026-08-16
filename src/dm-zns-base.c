@@ -135,7 +135,13 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private          = c;
 	ti->num_flush_bios   = 1;
-	ti->num_discard_bios = 1;
+
+	/*
+	 * discard 는 광고하지 않는다. LBA→PBA 매핑을 거치므로 상위가 보낸
+	 * 범위를 하위에 그대로 적용하면 남의 데이터를 날린다. 매핑 무효화로
+	 * 구현하는 것이 맞고, 그건 M3 의 GC 와 함께 온다.
+	 */
+	ti->num_discard_bios = 0;
 
 	DMINFO("ctr: M1 target attached on '%s', %llu blocks (%llu sectors)",
 	       argv[0],
@@ -359,8 +365,11 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
 
-	/* FLUSH / DISCARD는 underlying으로 pass-through */
-	if (bio->bi_opf & REQ_PREFLUSH || bio_op(bio) == REQ_OP_DISCARD) {
+	/*
+	 * DM 이 데이터와 분리해 내려보내는 빈 flush bio. 길이가 0 이라
+	 * 주소 변환할 것이 없으므로 그대로 하위로 넘긴다.
+	 */
+	if (bio->bi_opf & REQ_PREFLUSH) {
 		bio_set_dev(bio, c->dev->bdev);
 		return DM_MAPIO_REMAPPED;
 	}
@@ -371,9 +380,16 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
 	case REQ_OP_READ:
 		return zns_handle_read(ti, bio);
 	default:
-		/* WRITE_ZEROES 등은 pass-through */
-		bio_set_dev(bio, c->dev->bdev);
-		return DM_MAPIO_REMAPPED;
+		/*
+		 * DISCARD / WRITE_ZEROES 등은 지원하지 않는다.
+		 *
+		 * 하위로 그냥 넘기면 LBA 를 PBA 로 착각해 엉뚱한 물리 영역을
+		 * 날린다 — 그 자리에는 다른 LBA 의 살아 있는 데이터가 있다.
+		 * 제대로 하려면 매핑 무효화로 처리해야 하고 그건 M3 의 GC 와
+		 * 같이 온다. 그때까지는 광고도 하지 않고(ctr 참고) 받지도 않는다.
+		 */
+		DMERR_LIMIT("unsupported bio op %u", bio_op(bio));
+		return DM_MAPIO_KILL;
 	}
 }
 
@@ -394,6 +410,45 @@ static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 	limits->features &= ~BLK_FEAT_ZONED;
 	limits->chunk_sectors = bdev_zone_sectors(c->dev->bdev);
+}
+
+/* ==================================================================
+ * status — dmsetup status 로 소모량을 들여다본다
+ *
+ * GC 가 없는 동안(M3 이전) wp 는 되돌아오지 않으므로, 논리적으로 같은
+ * 자리를 덮어써도 물리 공간은 계속 줄어든다. 그 소모를 눈으로 봐야
+ * M2 의 여유가 얼마나 남는지, M3 이 무엇을 회수해야 하는지 알 수 있다.
+ *
+ *   $ dmsetup status my-m1-device
+ *   0 4194304 zns-base 1234567 4194304
+ *                      ^wp      ^전체(섹터)
+ * ================================================================== */
+
+static void zns_base_status(struct dm_target *ti, status_type_t type,
+			    unsigned int status_flags, char *result,
+			    unsigned int maxlen)
+{
+	struct zns_base_c *c = ti->private;
+	unsigned int sz = 0;
+	unsigned long flags;
+	sector_t wp;
+
+	switch (type) {
+	case STATUSTYPE_INFO:
+		spin_lock_irqsave(&c->map_lock, flags);
+		wp = c->wp_offset;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+
+		DMEMIT("%llu %llu",
+		       (unsigned long long)wp,
+		       (unsigned long long)c->total_sectors);
+		break;
+	case STATUSTYPE_TABLE:
+		DMEMIT("%s", c->dev->name);
+		break;
+	default:
+		break;
+	}
 }
 
 /* ==================================================================
@@ -432,6 +487,7 @@ static struct target_type zns_base_target = {
 	/* .report_zones 없음 — 위쪽에 zoned를 노출하지 않음 */
 	//.iterate_devices = zns_base_iterate_devices,
 	.io_hints        = zns_base_io_hints,
+	.status          = zns_base_status,
 };
 
 static int __init zns_base_init(void)

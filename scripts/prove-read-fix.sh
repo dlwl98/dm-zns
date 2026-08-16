@@ -89,5 +89,5 @@ else
 fi
 
 echo
-echo "  정리:  sudo dmsetup remove $DM_NAME && sudo rmmod $MOD_NAME && sudo bash scripts/nullblk-down.sh"
+echo "  정리:  sudo bash scripts/teardown.sh"
 exit $rc
