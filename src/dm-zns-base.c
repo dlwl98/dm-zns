@@ -213,7 +213,11 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 	if (!io)
 		goto err_io;
 
-	clone = bio_clone_fast(bio, GFP_NOIO, &fs_bio_set);
+	/*
+	 * bio_clone_fast()는 5.18에서 제거됐다. 대체 API인 bio_alloc_clone()은
+	 * 대상 bdev를 직접 인자로 받으므로 뒤따르던 bio_set_dev()가 필요 없다.
+	 */
+	clone = bio_alloc_clone(c->dev->bdev, bio, GFP_NOIO, &fs_bio_set);
 	if (!clone) {
 		kfree(io);
 		goto err_io;
@@ -221,8 +225,7 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 
 	io->orig = bio;
 
-	/* clone이 도착할 ZNS 장치와 순차 쓰기 위치를 설정 */
-	bio_set_dev(clone, c->dev->bdev);
+	/* 순차 쓰기 위치 지정 */
 	clone->bi_iter.bi_sector = pba;
 	clone->bi_end_io         = zns_write_end_io;
 	clone->bi_private        = io;
@@ -305,14 +308,18 @@ static int zns_base_map(struct dm_target *ti, struct bio *bio)
  * io_hints — 위쪽을 conventional 블록 디바이스로 광고
  *
  * M1의 핵심: 위쪽(ext4 등)에는 zoned 제약을 완전히 숨긴다.
- * BLK_ZONED_NONE으로 설정하면 zone 크기·write pointer 제약이
- * 상위 큐로 전파되지 않는다.
+ *
+ * 커널 6.11 전후로 queue_limits.zoned(enum blk_zoned_model)가 사라지고
+ * features 비트필드의 BLK_FEAT_ZONED로 바뀌었다.
+ *   구: limits->zoned = BLK_ZONED_NONE;
+ *   신: limits->features &= ~BLK_FEAT_ZONED;
  * ================================================================== */
 
 static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct zns_base_c *c = ti->private;
-	limits->zoned = BLK_ZONED_NONE;
+
+	limits->features &= ~BLK_FEAT_ZONED;
 	limits->chunk_sectors = bdev_zone_sectors(c->dev->bdev);
 }
 
