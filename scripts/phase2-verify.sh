@@ -11,6 +11,9 @@
 # 사용:  sudo bash scripts/phase2-verify.sh
 set -uo pipefail
 
+# shellcheck source=scripts/common.sh
+. "$(dirname "$0")/common.sh"
+
 DM_NAME=${DM_NAME:-my-m1-device}
 UNDERLYING=${UNDERLYING:-/dev/nullb0}
 MOD_KO="src/dm-zns-base.ko"
@@ -44,7 +47,7 @@ create_target() {
 step "0. 환경 구성"
 teardown
 bash scripts/nullblk-up.sh >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
-insmod "$MOD_KO" || { echo "insmod 실패" >&2; exit 1; }
+zns_load_module "$MOD_KO" || exit 1
 create_target || { echo "dmsetup create 실패"; dmesg | tail -10; exit 1; }
 echo "  $DEV 준비 완료"
 

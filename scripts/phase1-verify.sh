@@ -9,6 +9,9 @@
 # 사용:  sudo bash scripts/phase1-verify.sh
 set -uo pipefail
 
+# shellcheck source=scripts/common.sh
+. "$(dirname "$0")/common.sh"
+
 DM_NAME=${DM_NAME:-my-m1-device}
 UNDERLYING=${UNDERLYING:-/dev/nullb0}
 MOD_KO="src/dm-zns-base.ko"
@@ -36,8 +39,8 @@ echo "  정리 완료"
 step "2. 환경 구성"
 bash scripts/nullblk-up.sh || { echo "nullblk-up 실패" >&2; exit 1; }
 
-insmod "$MOD_KO" || { echo "insmod 실패 — dmesg 확인" >&2; exit 1; }
-echo "  insmod OK"
+zns_load_module "$MOD_KO" || exit 1
+echo "  모듈 적재 OK (src/dm-zns-base.ko 와 srcversion 일치 확인)"
 
 SECTORS=$(blockdev --getsz "$UNDERLYING")
 echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || {

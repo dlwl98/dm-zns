@@ -10,6 +10,9 @@
 # 사용:  sudo bash scripts/prove-read-fix.sh [수정전_모듈_경로]
 set -uo pipefail
 
+# shellcheck source=scripts/common.sh
+. "$(dirname "$0")/common.sh"
+
 DM_NAME=${DM_NAME:-my-m1-device}
 UNDERLYING=${UNDERLYING:-/dev/nullb0}
 MOD_NAME="dm_zns_base"
@@ -39,7 +42,7 @@ run_diff_check() {
 
 	teardown
 	bash scripts/nullblk-up.sh >/dev/null || return 2
-	insmod "$ko" || return 2
+	zns_load_module "$ko" || return 2
 	sectors=$(blockdev --getsz "$UNDERLYING")
 	echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || return 2
 
