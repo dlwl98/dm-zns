@@ -35,12 +35,14 @@ step() { echo; echo "=== $* ==="; }
 #   $4 wp  $5 total  $6 mem_n  $7 nr_runs  $8 flushes  $9 compactions  $10 dropped
 stat_f() { dmsetup status "$DM_NAME" 2>/dev/null | awk -v n="$1" '{print $n}'; }
 
+# status: $4 used $5 total $6 free_z $7 nr_z $8 valid $9 gc $10 migrated
+#         $11 mem $12 runs $13 flushes $14 compactions $15 dropped
 show_stat() {
-	local wp tot mem runs fl cp dr
-	wp=$(stat_f 4);  tot=$(stat_f 5); mem=$(stat_f 6); runs=$(stat_f 7)
-	fl=$(stat_f 8);  cp=$(stat_f 9);  dr=$(stat_f 10)
-	printf "    wp %d MiB / %d MiB   memtable %s   runs %s   flush %s   compact %s   dropped %s\n" \
-		$((wp/2048)) $((tot/2048)) "$mem" "$runs" "$fl" "$cp" "$dr"
+	local used tot mem runs fl cp dr
+	used=$(stat_f 4); tot=$(stat_f 5); mem=$(stat_f 11); runs=$(stat_f 12)
+	fl=$(stat_f 13);  cp=$(stat_f 14); dr=$(stat_f 15)
+	printf "    used %d MiB / %d MiB   memtable %s   runs %s   flush %s   compact %s   dropped %s\n" \
+		$((used/2048)) $((tot/2048)) "$mem" "$runs" "$fl" "$cp" "$dr"
 }
 
 create_target() {
@@ -94,13 +96,13 @@ fi
 # =====================================================================
 step "T3. LSM 이 실제로 도는가"
 
-fl_before=$(stat_f 8); cp_before=$(stat_f 9)
+fl_before=$(stat_f 13); cp_before=$(stat_f 14)
 
 fio --name=bulk --filename="$DEV" --rw=write --bs=1M --size=256M \
     --ioengine=libaio --iodepth=8 --direct=1 --minimal >"$T/bulk.txt" 2>&1 \
 	|| bad "대량 쓰기 실패"
 
-fl_after=$(stat_f 8); cp_after=$(stat_f 9)
+fl_after=$(stat_f 13); cp_after=$(stat_f 14)
 echo "  256 MiB 기록 후:"
 show_stat
 
@@ -143,7 +145,7 @@ for r in $(seq 1 $ROUNDS); do
 done
 
 wp_mb=$(( $(stat_f 4) / 2048 ))
-dropped=$(stat_f 10)
+dropped=$(stat_f 15)
 dropped_mb=$(( dropped * 4 / 1024 ))      # 엔트리 1개 = 4 KiB 블록
 garbage_mb=$(( wp_mb - LIVE_MB ))
 
