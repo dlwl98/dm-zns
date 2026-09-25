@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * dm-zns-base: Random-to-Sequential Translation Target (M1–M3)
+ * dm-zns-base: Random-to-Sequential Translation Target
  *
  * 위(upper)쪽: conventional 블록 디바이스로 광고 — ext4 등 임의 I/O 허용.
  * 아래(lower)쪽: host-managed ZNS 디바이스의 sequential-write 제약을 우리가 처리.
@@ -13,7 +13,7 @@
  *             아직 쓰인 적 없는 LBA 는 zero-fill 후 완료.
  *   GC     — free zone 이 바닥나면 valid 가 가장 적은 FULL zone 을 골라
  *             살아있는 블록을 활성 zone 으로 이주시키고 zone 을 reset 해
- *             재사용한다 (M3).
+ *             재사용한다.
  *
  * ── LSM-Tree 인덱스 ─────────────────────────────────────────────────
  *
@@ -21,7 +21,7 @@
  *   flush:  MemTable 이 차면 중위 순회로 "정렬된 불변 run" 하나를 만든다
  *   컴팩션: run 이 쌓이면 하나로 병합. 같은 LBA 는 최신 것만 남는다.
  *
- * ── zone 관리 (M3) ──────────────────────────────────────────────────
+ * ── zone 관리 ───────────────────────────────────────────────────────
  *
  *   zone 상태: FREE → ACTIVE(할당 중) → FULL → (GC) → FREE
  *
@@ -61,17 +61,14 @@
  *   - 매핑 영속화 / crash recovery 없음.
  *   - GC 이주는 4 KiB 동기 I/O 페어(submit_bio_wait) — 정확성 우선,
  *     배치·비동기화는 성능 단계에서.
- *   - 사용자 쓰기 발행자가 여럿이면(다중 스레드 direct I/O 등) 사용자
- *     zone 안에서도 같은 순서 역전이 가능하다. 로컬 검증(fio 단일 잡,
- *     ext4 단일 flusher)에서는 발행자가 하나라 노출되지 않는다. 정석
- *     해법은 REQ_OP_ZONE_APPEND(디바이스가 위치를 정하므로 순서 무관)로,
- *     실제 NVMe ZNS 명령 경로를 쓰는 서버 단계의 몫이다.
+ *   - 사용자 쓰기 발행자가 여럿이면(다중 스레드, ext4 의 writeback 과
+ *     jbd2 등) 사용자 zone 안에서도 같은 순서 역전이 가능하다. 해법은
+ *     할당 순서대로 제출하는 단일 제출 경로, 또는 REQ_OP_ZONE_APPEND
+ *     (디바이스가 위치를 정하므로 순서 무관).
  *   - in-flight read 와 zone reset 의 경합: read 가 옛 PBA 로 remap 되어
  *     하위로 내려가는 사이 그 zone 이 이주 완료 → reset 되면 낡은 데이터를
  *     읽을 수 있다. 창이 극히 좁고(제출~완료 사이) MVP 범위 밖 — dm-zoned
- *     는 bio 추적으로 푼다. 문서화된 한계.
- *
- * See docs/07-milestones.md — M1, M2, M3.
+ *     는 bio 추적으로 푼다.
  */
 
 #include <linux/module.h>
@@ -88,6 +85,8 @@
 #include <linux/delay.h>
 #include <linux/highmem.h>
 #include <linux/workqueue.h>
+
+#include "zns-compat.h"	/* 5.15 / 6.17 API 차이 */
 
 #define DM_MSG_PREFIX "zns-base"
 
@@ -377,7 +376,7 @@ static void zns_refill_spares(struct zns_base_c *c)
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
 	if (need_ents)
-		ents = kvmalloc_array(NODE_POOL_MAX, sizeof(*ents), GFP_NOIO);
+		ents = zns_kvmalloc_array(NODE_POOL_MAX, sizeof(*ents), GFP_NOIO);
 	if (need_run)
 		run = kzalloc(sizeof(*run), GFP_NOIO);
 
@@ -417,7 +416,7 @@ static struct zns_ent *zns_merge_runs(struct zns_run **snap, unsigned int k,
 		return NULL;
 	}
 
-	out = kvmalloc_array(total, sizeof(*out), GFP_NOIO);
+	out = zns_kvmalloc_array(total, sizeof(*out), GFP_NOIO);
 	if (!out)
 		return NULL;
 
@@ -607,12 +606,12 @@ static sector_t zone_alloc_locked(struct zns_base_c *c, sector_t len_sectors,
 
 /* 4 KiB 동기 I/O 한 건. sleepable. */
 static int zns_rw_block(struct zns_base_c *c, sector_t sect, struct page *pg,
-			enum req_op op)
+			zns_req_op_t op)
 {
 	struct bio *b;
 	int ret;
 
-	b = bio_alloc(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO);
+	b = zns_bio_alloc(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO);
 	if (!b)
 		return -ENOMEM;
 
@@ -674,8 +673,8 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 
 	/* ---- 스냅샷용 메모리 (락 밖 선할당) ---- */
 	max_cand = (unsigned int)(c->zone_sectors >> BLOCK_SHIFT);
-	mem_snap = kvmalloc_array(NODE_POOL_MAX, sizeof(*mem_snap), GFP_NOIO);
-	cand     = kvmalloc_array(max_cand, sizeof(*cand), GFP_NOIO);
+	mem_snap = zns_kvmalloc_array(NODE_POOL_MAX, sizeof(*mem_snap), GFP_NOIO);
+	cand     = zns_kvmalloc_array(max_cand, sizeof(*cand), GFP_NOIO);
 	pg       = alloc_page(GFP_NOIO);
 	if (!mem_snap || !cand || !pg) {
 		ret = -ENOMEM;
@@ -879,8 +878,8 @@ do_reset:
 	 * 매핑에서 도달할 수 없으므로 새 참조가 생기지 않고, gc_lock 이
 	 * 다른 GC 의 접근을 막는다.
 	 */
-	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
-			       vstart, c->zone_sectors);
+	ret = zns_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
+			    vstart, c->zone_sectors);
 	if (ret) {
 		DMERR("gc: zone reset failed on zone %d: %d", vidx, ret);
 		goto out;
@@ -1001,8 +1000,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * 라 dtr 에서 사라지므로, 하위에 남아 있던 데이터는 어차피 도달
 	 * 불가 — 지워도 잃을 것이 없다. (영속화 도입 시 되돌릴 결정.)
 	 */
-	ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, 0,
-			       bdev_nr_sectors(c->dev->bdev));
+	ret = zns_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, 0,
+			    bdev_nr_sectors(c->dev->bdev));
 	if (ret) {
 		ti->error = "failed to reset zones on underlying device";
 		goto err_free;
@@ -1011,7 +1010,7 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private        = c;
 	ti->num_flush_bios = 1;
 
-	/* discard 미지원 — 매핑 무효화로 구현해야 하며 M3 GC 확장 몫 */
+	/* discard 미지원 — 하위로 넘기면 안 되고, 매핑 무효화로 구현해야 한다 */
 	ti->num_discard_bios = 0;
 
 	/*
@@ -1114,7 +1113,7 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 		goto err_out;
 	}
 
-	clone = bio_alloc_clone(c->dev->bdev, bio, GFP_NOIO, &fs_bio_set);
+	clone = zns_bio_clone(c->dev->bdev, bio, GFP_NOIO, &fs_bio_set);
 	if (!clone) {
 		kfree(io);
 		err = BLK_STS_RESOURCE;
@@ -1307,7 +1306,7 @@ static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct zns_base_c *c = ti->private;
 
-	limits->features &= ~BLK_FEAT_ZONED;
+	zns_limits_clear_zoned(limits);
 	limits->chunk_sectors = bdev_zone_sectors(c->dev->bdev);
 }
 
