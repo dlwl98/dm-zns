@@ -15,3 +15,9 @@ Module.symvers
 .idea/
 *.swp
 .DS_Store
+
+# fio verify state
+*-verify.state
+
+# local experiment scripts
+scripts/exp-*.sh
