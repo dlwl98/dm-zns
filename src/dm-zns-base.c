@@ -25,12 +25,22 @@
  *
  *   zone 상태: FREE → ACTIVE(할당 중) → FULL → (GC) → FREE
  *
- *   활성 zone 은 사용자용/GC용 두 개를 분리한다. 하위 ZNS 는 zone 별
- *   wp 위치의 쓰기만 받는데, 할당 순서와 제출 순서는 발행자가 둘이면
- *   달라질 수 있다 — 사용자 쓰기는 .map 에서 할당 후 bio_list 를 거쳐
- *   지연 제출되고, GC 워커는 즉시 제출하므로, 같은 zone 을 공유하면
- *   나중에 할당받은 GC 쓰기가 먼저 도착해 SEQ 위반(EIO)이 난다.
- *   zone 을 발행자별로 나누면 zone 내 순서는 각 발행자가 스스로 지킨다.
+ *   하위 ZNS 는 zone 별 wp 위치의 쓰기만 받으므로, 한 zone 에 대한 쓰기는
+ *   할당 순서대로 장치에 도착해야 한다. 그래서 zone 마다 제출자를 하나로
+ *   둔다:
+ *     - 사용자 zone: 순서 보장 제출 워커(sub_wq) 하나. .map 은 할당과 같은
+ *       map_lock 구간에서 bio 를 sub_list 에 넣기만 하고, 워커가 그 순서
+ *       대로 보낸다. .map 에서 바로 제출하면 current->bio_list 때문에 제출이
+ *       .map 이 끝날 때까지 미뤄져, 여러 스레드(ext4 의 writeback 과 jbd2
+ *       만으로도 둘)가 쓰면 순서가 뒤바뀐다.
+ *     - GC zone: GC 워커 하나(gc_lock). 동기 I/O 라 순서가 자명하다.
+ *   5.15 는 zone 당 쓰기를 한 번에 하나씩 내보내는 장치가 mq-deadline 뿐이라
+ *   하위 스케줄러가 mq-deadline 이어야 한다(ctr 가 확인).
+ *
+ *   zone 별 진행 중 I/O 수(wr_inflight / rd_inflight)를 센다. GC 는 쓰기가
+ *   남은 zone 을 이주하지 않고, 읽기·쓰기가 모두 끝나기 전에는 reset 하지
+ *   않는다. 쓰기가 거절되면 그 zone 을 즉시 마감한다(하위 wp 가 어긋나
+ *   이후 쓰기가 전부 거절되는 것을 막는다).
  *
  *   valid[z] 불변식: "map_lookup() 이 zone z 를 가리키게 되는 서로 다른
  *   LBA 블록의 수". map_lock 아래의 매핑 갱신에서만 변한다:
@@ -59,16 +69,17 @@
  *
  * 한계(stretch / 알려진 것):
  *   - 매핑 영속화 / crash recovery 없음.
- *   - GC 이주는 4 KiB 동기 I/O 페어(submit_bio_wait) — 정확성 우선,
- *     배치·비동기화는 성능 단계에서.
- *   - 사용자 쓰기 발행자가 여럿이면(다중 스레드, ext4 의 writeback 과
- *     jbd2 등) 사용자 zone 안에서도 같은 순서 역전이 가능하다. 해법은
- *     할당 순서대로 제출하는 단일 제출 경로, 또는 REQ_OP_ZONE_APPEND
- *     (디바이스가 위치를 정하므로 순서 무관).
- *   - in-flight read 와 zone reset 의 경합: read 가 옛 PBA 로 remap 되어
- *     하위로 내려가는 사이 그 zone 이 이주 완료 → reset 되면 낡은 데이터를
- *     읽을 수 있다. 창이 극히 좁고(제출~완료 사이) MVP 범위 밖 — dm-zoned
- *     는 bio 추적으로 푼다.
+ *   - GC 이주는 4 KiB 동기 I/O 페어(submit_bio_wait).
+ *   - 사용자 쓰기는 활성 zone 하나에 제출자 하나라 장치 기준 zone 당 QD 1.
+ *   - 거절된 쓰기의 매핑은 되돌리지 않는다(쓰이지 않은 PBA 를 가리킨 채
+ *     남는다). 상위는 이미 EIO 를 받았다. 마감 전에 그 zone 에 할당된 뒤쪽
+ *     쓰기들도 같이 거절된다.
+ *   - zone capacity 가 zone size 보다 작은 장치는 지원하지 않는다(쓰기 한도를
+ *     zone size 로 잡는다).
+ *   - 일찍 마감한 zone 에 ZONE_FINISH 를 보내지 않는다 — active zone 수에
+ *     한도가 있는 장치에서는 한도에 걸릴 수 있다.
+ *   - 하위 장치에 cgroup 쓰기 제한(blk-throttle)이 걸리면 제출 순서가 바뀔
+ *     수 있다.
  */
 
 #include <linux/module.h>
@@ -116,6 +127,15 @@
 #define GC_RESERVED_ZONES	1U
 /* 쓰기 경로에서 할당 실패 시 GC 를 몇 번까지 시도할지 */
 #define WRITE_GC_RETRIES	4U
+/*
+ * 입장 제어: 할당됐지만 아직 완료되지 않은 사용자 쓰기의 상한.
+ * 제출 워커가 하나뿐이라, 상한이 없으면 writeback 이 수 GiB 를 큐에 쌓고
+ * 그 뒤에 선 fsync/jbd2 쓰기가 한참 밀린다. 동기 쓰기(REQ_SYNC/META/PRIO)
+ * 는 두 배까지 허용해 백그라운드 쓰기에 막히지 않게 한다.
+ */
+#define ZNS_QUEUE_MAX_BYTES	(32ULL << 20)
+/* GC 가 victim 의 진행 중 I/O 를 기다리는 최대 시간 */
+#define ZNS_QUIESCE_TIMEOUT	(30 * HZ)
 
 /* ------------------------------------------------------------------ *
  * 자료구조                                                             *
@@ -148,14 +168,22 @@ enum zns_zone_state {
 
 struct zns_zone {
 	sector_t	start;	/* zone 시작 (절대 섹터) */
-	sector_t	wp;	/* 다음 쓰기 위치 (절대 섹터) — 하위 wp 와 일치 */
+	sector_t	wp;	/* 다음 할당 위치 (절대 섹터) */
+	sector_t	sub_wp;	/* 제출 워커가 다음에 보내야 할 위치 (자가 검사용) */
 	u32		valid;	/* 이 zone 을 가리키는 살아있는 매핑 수 (블록) */
 	u8		state;
+	atomic_t	wr_inflight;	/* 할당됐지만 아직 완료되지 않은 사용자 쓰기 */
+	atomic_t	rd_inflight;	/* 이 zone 으로 remap 된 진행 중 읽기 */
 };
 
-/* 쓰기 완료 콜백 context */
-struct zns_write_io {
-	struct bio *orig;
+/*
+ * bio 별 상태 (ti->per_io_data_size). .map 입구에서 zidx = -1 로 초기화하고,
+ * zone 에 걸린 I/O 만 zidx 를 채운다. .end_io 는 zidx 로 뒷정리를 한다.
+ */
+struct zns_pio {
+	int		zidx;
+	bool		write;
+	unsigned int	bytes;	/* 입장 제어에 잡힌 쓰기 크기 */
 };
 
 /* GC 이주 후보 */
@@ -193,11 +221,20 @@ struct zns_base_c {
 	unsigned int		 nr_runs;
 	bool			 compacting;	/* 컴팩션/GC 스캔 상호 배제 */
 
+	/* --- 순서 보장 제출 --- */
+	struct bio_list	 sub_list;	/* map_lock. 사용자 쓰기, 할당 순서 그대로 */
+	struct workqueue_struct *sub_wq;	/* ordered — 사용자 쓰기의 유일한 제출자 */
+	struct work_struct	 sub_work;
+	atomic64_t	 queued_bytes;	/* 할당됐지만 완료 안 된 사용자 쓰기 */
+	wait_queue_head_t admit_wq;	/* queued_bytes 가 줄면 깨운다 */
+	wait_queue_head_t idle_wq;	/* zone 의 inflight 가 0 이 되면 깨운다 */
+
 	/* --- GC --- */
 	struct mutex	 gc_lock;	/* GC 는 한 번에 하나 */
 	struct workqueue_struct *gc_wq;	/* GC 전용 — .map 에서 직접 못 도는 이유는
 					 * 파일 머리 주석 참고 */
 	struct work_struct	 gc_work;
+	struct bio_set	 gc_bs;		/* GC I/O 전용 — 상위와 풀을 나눠 쓰지 않는다 */
 
 	/* --- 통계 (dmsetup status) --- */
 	u64	stat_flushes;
@@ -205,11 +242,23 @@ struct zns_base_c {
 	u64	stat_dropped;	/* 인덱스에서 제거된 중복 엔트리 수 */
 	u64	stat_gc_runs;	/* 회수 완료한 zone 수 */
 	u64	stat_migrated;	/* GC 가 이주시킨 블록 수 */
+	u64	stat_write_err;	/* 하위가 거절한 사용자 쓰기 */
+	u64	stat_order_viol; /* 제출 워커의 자가 검사 위반 (0 이어야 함) */
 };
+
+static inline unsigned int zidx_of(struct zns_base_c *c, sector_t pba)
+{
+	return (unsigned int)(pba / c->zone_sectors);
+}
 
 static inline struct zns_zone *zone_of(struct zns_base_c *c, sector_t pba)
 {
-	return &c->zones[pba / c->zone_sectors];
+	return &c->zones[zidx_of(c, pba)];
+}
+
+static inline struct zns_pio *zns_pio(struct bio *bio)
+{
+	return dm_per_bio_data(bio, sizeof(struct zns_pio));
 }
 
 /* ==================================================================
@@ -584,8 +633,10 @@ static sector_t zone_alloc_locked(struct zns_base_c *c, sector_t len_sectors,
 		for (i = 0; i < c->nr_zones; i++) {
 			if (c->zones[i].state == ZNS_ZONE_FREE) {
 				z = &c->zones[i];
+				WARN_ON_ONCE(atomic_read(&z->wr_inflight));
 				z->state = ZNS_ZONE_ACTIVE;
 				z->wp = z->start;
+				z->sub_wp = z->start;
 				*aidx = i;
 				c->free_zones--;
 				break;
@@ -611,7 +662,7 @@ static int zns_rw_block(struct zns_base_c *c, sector_t sect, struct page *pg,
 	struct bio *b;
 	int ret;
 
-	b = zns_bio_alloc(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO);
+	b = zns_bio_alloc_bs(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO, &c->gc_bs);
 	if (!b)
 		return -ENOMEM;
 
@@ -629,9 +680,11 @@ static int zns_rw_block(struct zns_base_c *c, sector_t sect, struct page *pg,
 /*
  * victim 선정. map_lock 필요.
  * FULL 중 valid 최소. valid==0 이면 이주 없이 공짜로 회수된다.
+ * 전부 살아 있는 zone 은 옮겨도 빈 공간이 생기지 않으므로 고르지 않는다.
  */
 static int zns_pick_victim_locked(struct zns_base_c *c)
 {
+	u32 zone_blocks = (u32)(c->zone_sectors >> BLOCK_SHIFT);
 	int best = -1;
 	u32 best_valid = U32_MAX;
 	unsigned int i;
@@ -639,7 +692,7 @@ static int zns_pick_victim_locked(struct zns_base_c *c)
 	for (i = 0; i < c->nr_zones; i++) {
 		struct zns_zone *z = &c->zones[i];
 
-		if (z->state != ZNS_ZONE_FULL)
+		if (z->state != ZNS_ZONE_FULL || z->valid >= zone_blocks)
 			continue;
 		if (z->valid < best_valid) {
 			best = i;
@@ -669,7 +722,7 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	sector_t vstart, vend;
 	unsigned int mem_n = 0, k = 0, kmax, ncand = 0, ci;
 	unsigned int max_cand;
-	int vidx, ret = 0, tries;
+	int vidx, ret = 0, tries, restarts = 0;
 
 	/* ---- 스냅샷용 메모리 (락 밖 선할당) ---- */
 	max_cand = (unsigned int)(c->zone_sectors >> BLOCK_SHIFT);
@@ -686,6 +739,7 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	 * 컴팩션이 run 을 kvfree 하는 동안 우리가 그 run 배열을 락 밖에서
 	 * 스캔하면 use-after-free 다.
 	 */
+restart:
 	for (tries = 0; ; tries++) {
 		spin_lock_irqsave(&c->map_lock, flags);
 		if (!c->compacting)
@@ -711,6 +765,26 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	victim = &c->zones[vidx];
 	vstart = victim->start;
 	vend   = victim->start + c->zone_sectors;
+
+	/*
+	 * FULL 로 마감된 직후의 zone 에는 아직 장치에 닿지 않은 쓰기가 남아
+	 * 있을 수 있다. 그 상태에서 이주하면 안 쓰인 블록을 읽어 옮기고, reset
+	 * 하면 뒤늦은 쓰기가 거절된다. FULL 이면 새 할당이 없으므로 wr_inflight
+	 * 는 줄기만 하고, 그 쓰기들은 제출 워커가 독립적으로 내보내므로 기다림은
+	 * 끝난다.
+	 */
+	if (atomic_read(&victim->wr_inflight)) {
+		c->compacting = false;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		if (++restarts > 3 ||
+		    !wait_event_timeout(c->idle_wq,
+					!atomic_read(&victim->wr_inflight),
+					ZNS_QUIESCE_TIMEOUT)) {
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+		goto restart;
+	}
 
 	if (victim->valid == 0) {
 		/* 이주할 것이 없다 — 스냅 불필요, 바로 reset 으로 */
@@ -832,8 +906,18 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 		}
 
 		ret = zns_rw_block(c, new_pba, pg, REQ_OP_WRITE);
-		if (ret)
+		if (ret) {
+			/* 하위 wp 가 우리 할당 위치와 어긋났다 — 이 GC zone 은 더 못 쓴다 */
+			spin_lock_irqsave(&c->map_lock, flags);
+			if (c->active_gc_idx == (int)zidx_of(c, new_pba)) {
+				c->zones[c->active_gc_idx].state = ZNS_ZONE_FULL;
+				c->active_gc_idx = -1;
+			}
+			spin_unlock_irqrestore(&c->map_lock, flags);
+			DMERR_LIMIT("gc: write error %d at %llu, gc zone sealed",
+				    ret, (unsigned long long)new_pba);
 			goto out;
+		}
 
 		/*
 		 * CAS: 복사하는 동안 사용자가 같은 LBA 를 덮어썼다면 매핑이
@@ -872,6 +956,21 @@ do_reset:
 		goto out;
 	}
 	spin_unlock_irqrestore(&c->map_lock, flags);
+
+	/*
+	 * valid 0 이면 이 zone 으로 새로 remap 되는 읽기가 없다(map_lookup 이
+	 * 더는 이 zone 을 돌려주지 않는다). 이미 remap 된 읽기와 남은 쓰기만
+	 * 끝나면 reset 해도 된다. inflight 증가와 valid 검사는 둘 다 map_lock
+	 * 아래라, valid 0 을 본 뒤에는 inflight 가 늘지 않는다.
+	 */
+	if (!wait_event_timeout(c->idle_wq,
+				!atomic_read(&victim->rd_inflight) &&
+				!atomic_read(&victim->wr_inflight),
+				ZNS_QUIESCE_TIMEOUT)) {
+		DMWARN("gc: zone %d still has I/O in flight, reset deferred", vidx);
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 
 	/*
 	 * reset 은 sleepable 이라 락 밖. victim 은 FULL & valid 0 —
@@ -913,6 +1012,8 @@ static void zns_gc_workfn(struct work_struct *w)
 	mutex_unlock(&c->gc_lock);
 }
 
+static void zns_sub_workfn(struct work_struct *w);
+
 /* ==================================================================
  * Constructor / Destructor
  * ================================================================== */
@@ -938,30 +1039,59 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	spin_lock_init(&c->map_lock);
 	mutex_init(&c->gc_lock);
 	INIT_WORK(&c->gc_work, zns_gc_workfn);
+	INIT_WORK(&c->sub_work, zns_sub_workfn);
+	bio_list_init(&c->sub_list);
+	atomic64_set(&c->queued_bytes, 0);
+	init_waitqueue_head(&c->admit_wq);
+	init_waitqueue_head(&c->idle_wq);
 	c->memtable = RB_ROOT;
 	INIT_LIST_HEAD(&c->runs);
 	c->active_user_idx = -1;
 	c->active_gc_idx   = -1;
 
-	/* 쓰기 진행이 GC 에 달려 있으므로 메모리 압박에서도 굴러야 한다 */
-	c->gc_wq = alloc_workqueue("zns-gc", WQ_MEM_RECLAIM, 1);
-	if (!c->gc_wq) {
-		ti->error = "cannot create gc workqueue";
-		kfree(c);
-		return -ENOMEM;
+	if (ti->len & (SECTORS_PER_BLOCK - 1)) {
+		ti->error = "length must be a multiple of 4 KiB";
+		ret = -EINVAL;
+		goto err_c;
+	}
+
+	/* 쓰기 진행이 GC 와 제출 워커에 달려 있으므로 메모리 압박에서도 굴러야 한다 */
+	c->gc_wq  = alloc_workqueue("zns-gc", WQ_MEM_RECLAIM, 1);
+	c->sub_wq = alloc_ordered_workqueue("zns-sub", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+	if (!c->gc_wq || !c->sub_wq) {
+		ti->error = "cannot create workqueues";
+		ret = -ENOMEM;
+		goto err_wq;
+	}
+
+	ret = bioset_init(&c->gc_bs, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+	if (ret) {
+		ti->error = "cannot create gc bioset";
+		goto err_wq;
 	}
 
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
 			    &c->dev);
 	if (ret) {
 		ti->error = "failed to open underlying device";
-		kfree(c);
-		return ret;
+		goto err_bs;
 	}
 
 	c->zone_sectors = bdev_zone_sectors(c->dev->bdev);
-	if (!c->zone_sectors) {
+	if (!c->zone_sectors || (c->zone_sectors & (SECTORS_PER_BLOCK - 1))) {
 		ti->error = "underlying device is not zoned";
+		ret = -EINVAL;
+		goto err_dev;
+	}
+
+	if (bdev_logical_block_size(c->dev->bdev) > (SECTORS_PER_BLOCK << SECTOR_SHIFT)) {
+		ti->error = "underlying logical block size is larger than 4 KiB";
+		ret = -EINVAL;
+		goto err_dev;
+	}
+
+	if (!zns_zone_order_backend_ok(c->dev->bdev)) {
+		ti->error = "set the zoned device's I/O scheduler to mq-deadline";
 		ret = -EINVAL;
 		goto err_dev;
 	}
@@ -989,9 +1119,12 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	for (i = 0; i < c->nr_zones; i++) {
-		c->zones[i].start = (sector_t)i * c->zone_sectors;
-		c->zones[i].wp    = c->zones[i].start;
-		c->zones[i].state = ZNS_ZONE_FREE;
+		c->zones[i].start  = (sector_t)i * c->zone_sectors;
+		c->zones[i].wp     = c->zones[i].start;
+		c->zones[i].sub_wp = c->zones[i].start;
+		c->zones[i].state  = ZNS_ZONE_FREE;
+		atomic_set(&c->zones[i].wr_inflight, 0);
+		atomic_set(&c->zones[i].rd_inflight, 0);
 	}
 	c->free_zones = c->nr_zones;
 
@@ -1007,8 +1140,10 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto err_free;
 	}
 
-	ti->private        = c;
-	ti->num_flush_bios = 1;
+	ti->private          = c;
+	ti->num_flush_bios   = 1;
+	ti->per_io_data_size = sizeof(struct zns_pio);
+	zns_set_accounts_remapped(ti);
 
 	/* discard 미지원 — 하위로 넘기면 안 되고, 매핑 무효화로 구현해야 한다 */
 	ti->num_discard_bios = 0;
@@ -1037,7 +1172,14 @@ err_free:
 	kfree(c->spare_run);
 err_dev:
 	dm_put_device(ti, c->dev);
-	destroy_workqueue(c->gc_wq);
+err_bs:
+	bioset_exit(&c->gc_bs);
+err_wq:
+	if (c->sub_wq)
+		destroy_workqueue(c->sub_wq);
+	if (c->gc_wq)
+		destroy_workqueue(c->gc_wq);
+err_c:
 	kfree(c);
 	return ret;
 }
@@ -1047,7 +1189,10 @@ static void zns_base_dtr(struct dm_target *ti)
 	struct zns_base_c *c = ti->private;
 	struct zns_run *r, *tmp;
 
-	destroy_workqueue(c->gc_wq);	/* pending GC 를 끝내고 내린다 */
+	/* dtr 시점엔 진행 중 I/O 가 없다(DM 보장). 남은 작업만 끝내고 내린다. */
+	destroy_workqueue(c->sub_wq);
+	destroy_workqueue(c->gc_wq);
+	bioset_exit(&c->gc_bs);
 
 	list_for_each_entry_safe(r, tmp, &c->runs, list) {
 		list_del(&r->list);
@@ -1068,29 +1213,73 @@ static void zns_base_dtr(struct dm_target *ti)
  * Write I/O
  * ================================================================== */
 
-static void zns_write_end_io(struct bio *clone)
+/*
+ * 사용자 쓰기의 유일한 제출자.
+ *
+ * .map 은 PBA 할당과 같은 map_lock 구간에서 bio 를 sub_list 에 넣으므로
+ * 목록 순서가 곧 할당 순서다. 이 워커는 목록을 그 순서대로 하위에 보낸다.
+ * 워커 컨텍스트에는 current->bio_list 가 없어 submit 이 블록 계층 입구
+ * (5.15: mq-deadline 삽입, 6.10+: zone write plug)까지 즉시 진행되므로,
+ * 장치에 도착하는 순서도 할당 순서와 같다. .map 에서 바로 제출하면 제출이
+ * .map 이 끝날 때까지 미뤄져, 발행자가 여럿일 때 나중에 할당받은 쓰기가
+ * 먼저 도착한다.
+ */
+static void zns_sub_workfn(struct work_struct *w)
 {
-	struct zns_write_io *io = clone->bi_private;
-	struct bio *orig        = io->orig;
+	struct zns_base_c *c = container_of(w, struct zns_base_c, sub_work);
+	struct bio_list list;
+	struct blk_plug plug;
+	unsigned long flags;
+	struct bio *bio;
 
-	orig->bi_status = clone->bi_status;
-	bio_endio(orig);
+	for (;;) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		list = c->sub_list;
+		bio_list_init(&c->sub_list);
+		spin_unlock_irqrestore(&c->map_lock, flags);
 
-	kfree(io);
-	bio_put(clone);
+		if (bio_list_empty(&list))
+			return;
+
+		blk_start_plug(&plug);
+		while ((bio = bio_list_pop(&list))) {
+			struct zns_zone *z = &c->zones[zns_pio(bio)->zidx];
+
+			/* 제출 후에는 bio 를 건드리지 않는다 — 완료가 먼저 올 수 있다 */
+			if (unlikely(bio->bi_iter.bi_sector != z->sub_wp)) {
+				c->stat_order_viol++;
+				DMERR_LIMIT("submit order: sector %llu, expected %llu",
+					    (unsigned long long)bio->bi_iter.bi_sector,
+					    (unsigned long long)z->sub_wp);
+			}
+			z->sub_wp = bio_end_sector(bio);
+			zns_submit_remapped(bio);
+		}
+		blk_finish_plug(&plug);
+		cond_resched();
+	}
+}
+
+/* 입장 제어. 할당 전에, 락 없이 부른다. */
+static void zns_admit(struct zns_base_c *c, struct bio *bio)
+{
+	u64 limit = ZNS_QUEUE_MAX_BYTES;
+
+	if (bio->bi_opf & (REQ_SYNC | REQ_META | REQ_PRIO))
+		limit *= 2;
+	wait_event(c->admit_wq, (u64)atomic64_read(&c->queued_bytes) < limit);
 }
 
 static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
-	sector_t lba         = bio->bi_iter.bi_sector;
+	struct zns_pio *pio  = zns_pio(bio);
+	sector_t lba         = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	sector_t len_sectors = bio_sectors(bio);
 	sector_t block_idx   = lba >> BLOCK_SHIFT;
 	sector_t nr_blocks;
 	sector_t pba;
 	sector_t i;
-	struct zns_write_io *io;
-	struct bio *clone;
 	unsigned long flags;
 	bool need_refill, low_free;
 	unsigned int gc_tries = 0, mem_tries = 0;
@@ -1101,24 +1290,21 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	nr_blocks = (len_sectors + SECTORS_PER_BLOCK - 1) >> BLOCK_SHIFT;
-
-	/*
-	 * 실패할 수 있는 일(할당)은 전부 잠금 구간 앞에. 인덱스를 갱신한
-	 * 뒤에 실패하면 쓰이지 않은 PBA 를 가리키는 매핑이 남는다.
-	 */
-	io = kmalloc(sizeof(*io), GFP_NOIO);
-	if (!io) {
-		err = BLK_STS_RESOURCE;
+	/* 매핑 단위는 4 KiB 블록이다. 위쪽에 4 KiB 논리 블록으로 광고하므로
+	 * 정상이라면 여기 오지 않는다. */
+	if ((lba | len_sectors) & (SECTORS_PER_BLOCK - 1)) {
+		DMERR_LIMIT("unaligned write: sector %llu, %llu sectors",
+			    (unsigned long long)lba, (unsigned long long)len_sectors);
+		err = BLK_STS_IOERR;
+		goto err_out;
+	}
+	nr_blocks = len_sectors >> BLOCK_SHIFT;
+	if (block_idx + nr_blocks > c->total_blocks) {
+		err = BLK_STS_IOERR;
 		goto err_out;
 	}
 
-	clone = zns_bio_clone(c->dev->bdev, bio, GFP_NOIO, &fs_bio_set);
-	if (!clone) {
-		kfree(io);
-		err = BLK_STS_RESOURCE;
-		goto err_out;
-	}
+	zns_admit(c, bio);
 
 again:
 	spin_lock_irqsave(&c->map_lock, flags);
@@ -1130,7 +1316,7 @@ again:
 		if (++mem_tries > 8) {
 			DMERR_LIMIT("memtable full and cannot flush");
 			err = BLK_STS_RESOURCE;
-			goto err_free;
+			goto err_out;
 		}
 		zns_refill_spares(c);
 		goto again;
@@ -1140,19 +1326,32 @@ again:
 
 	pba = zone_alloc_locked(c, len_sectors, false);
 	if (pba == PBA_UNMAPPED) {
+		u64 runs_before = c->stat_gc_runs;
+
 		spin_unlock_irqrestore(&c->map_lock, flags);
 
-		/* free zone 이 없다 — 워커에 GC 를 맡기고 완료를 기다린 뒤
+		/*
+		 * free zone 이 없다 — 워커에 GC 를 맡기고 완료를 기다린 뒤
 		 * 재시도. 여기서 zns_gc_once() 를 직접 부르면 안 되는 이유는
-		 * 파일 머리 주석(current->bio_list 자기 교착) 참고. */
-		if (++gc_tries > WRITE_GC_RETRIES) {
+		 * 파일 머리 주석(current->bio_list 자기 교착) 참고.
+		 *
+		 * GC 가 zone 을 회수하고 있는 동안은 계속 기다린다. 쓰는 쪽이
+		 * 여럿이면 회수된 공간을 다른 쪽이 먼저 가져갈 수 있어, 고정
+		 * 횟수로 끊으면 공간이 생기고 있는데도 ENOSPC 가 난다. 회수가
+		 * 연달아 WRITE_GC_RETRIES 번 없을 때만 포기한다.
+		 */
+		if (gc_tries >= WRITE_GC_RETRIES) {
 			DMERR_LIMIT("out of space: no reclaimable zone (valid data ~%u zones)",
 				    c->nr_zones - c->free_zones);
 			err = BLK_STS_NOSPC;
-			goto err_free;
+			goto err_out;
 		}
 		queue_work(c->gc_wq, &c->gc_work);
 		flush_work(&c->gc_work);
+
+		spin_lock_irqsave(&c->map_lock, flags);
+		gc_tries = (c->stat_gc_runs == runs_before) ? gc_tries + 1 : 0;
+		spin_unlock_irqrestore(&c->map_lock, flags);
 		goto again;
 	}
 
@@ -1161,9 +1360,6 @@ again:
 		sector_t new_blk_pba = pba + (i << BLOCK_SHIFT);
 		sector_t old = PBA_UNMAPPED;
 		int up;
-
-		if (idx >= c->total_blocks)
-			break;
 
 		up = mem_upsert(c, idx, new_blk_pba, &old);
 		if (up < 0) {
@@ -1186,16 +1382,36 @@ again:
 	need_refill = (!c->spare || !c->spare_run);
 	low_free = (c->free_zones <= GC_RESERVED_ZONES + 1);
 
+	/*
+	 * 제출 대기열에 넣는다 — 할당과 같은 락 구간이라 목록 순서 = 할당 순서.
+	 * 락을 푸는 순간 워커가 제출하고 완료까지 갈 수 있으므로, bio 와 pio 는
+	 * 여기서 전부 채우고 이후로는 건드리지 않는다.
+	 */
+	pio->zidx  = (int)zidx_of(c, pba);
+	pio->write = true;
+	pio->bytes = (unsigned int)(len_sectors << SECTOR_SHIFT);
+	atomic_inc(&c->zones[pio->zidx].wr_inflight);
+	atomic64_add(pio->bytes, &c->queued_bytes);
+
+	bio_set_dev(bio, c->dev->bdev);
+	bio->bi_iter.bi_sector = pba;
+#if ZNS_SCHED_ZONE_LOCK
+	/*
+	 * 5.15 의 mq-deadline 이 zone 순서를 지키는 것은 같은 우선순위 큐 안에서
+	 * 뿐이다. 우선순위가 섞이면(ionice, prioclass) 높은 쪽이 먼저 나가고,
+	 * FUA 쓰기는 스케줄러를 우회한다. 위쪽이 write-through 라 FUA 는 정상이라면
+	 * 붙어 오지 않는다.
+	 */
+	bio->bi_opf &= ~(REQ_FUA | REQ_PREFLUSH);
+	bio->bi_ioprio = 0;
+#endif
+	bio_list_add(&c->sub_list, bio);
+
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
-	io->orig = bio;
-	clone->bi_iter.bi_sector = pba;
-	clone->bi_end_io         = zns_write_end_io;
-	clone->bi_private        = io;
+	queue_work(c->sub_wq, &c->sub_work);
 
-	submit_bio_noacct(clone);
-
-	/* sleepable 뒷정리 */
+	/* sleepable 뒷정리 — 제출을 늦추지 않도록 큐에 넣은 뒤에 */
 	if (need_refill)
 		zns_refill_spares(c);
 	if (low_free)
@@ -1204,13 +1420,54 @@ again:
 
 	return DM_MAPIO_SUBMITTED;
 
-err_free:
-	bio_put(clone);
-	kfree(io);
 err_out:
 	bio->bi_status = err;
 	bio_endio(bio);
 	return DM_MAPIO_SUBMITTED;
+}
+
+/*
+ * 모든 bio 의 완료가 여기를 지난다. .map 이 zone 에 걸어 둔 것만 되돌린다.
+ *
+ * 쓰기가 거절되면 그 zone 의 하위 wp 는 우리 할당 위치와 어긋난다. 그대로
+ * 두면 그 zone 의 이후 쓰기가 전부 거절되므로 활성 zone 이면 바로 마감한다.
+ * 마감을 inflight 감소보다 먼저 해야, 그 사이에 zone 이 비워지고 다시 열린
+ * 뒤 엉뚱한 zone 을 마감하는 일이 없다.
+ */
+static int zns_base_end_io(struct dm_target *ti, struct bio *bio,
+			   blk_status_t *error)
+{
+	struct zns_base_c *c = ti->private;
+	struct zns_pio *pio  = zns_pio(bio);
+	struct zns_zone *z;
+	unsigned long flags;
+
+	if (pio->zidx < 0)
+		return DM_ENDIO_DONE;
+	z = &c->zones[pio->zidx];
+
+	if (pio->write) {
+		if (*error) {
+			spin_lock_irqsave(&c->map_lock, flags);
+			c->stat_write_err++;
+			if (c->active_user_idx == pio->zidx) {
+				z->state = ZNS_ZONE_FULL;
+				c->active_user_idx = -1;
+			}
+			spin_unlock_irqrestore(&c->map_lock, flags);
+			DMERR_LIMIT("write error %d in zone %d, zone sealed",
+				    blk_status_to_errno(*error), pio->zidx);
+		}
+		atomic64_sub(pio->bytes, &c->queued_bytes);
+		wake_up(&c->admit_wq);
+		if (atomic_dec_and_test(&z->wr_inflight))
+			wake_up_all(&c->idle_wq);
+	} else {
+		if (atomic_dec_and_test(&z->rd_inflight))
+			wake_up_all(&c->idle_wq);
+	}
+	pio->zidx = -1;
+	return DM_ENDIO_DONE;
 }
 
 /* ==================================================================
@@ -1220,7 +1477,7 @@ err_out:
 static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c  = ti->private;
-	sector_t lba          = bio->bi_iter.bi_sector;
+	sector_t lba          = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	sector_t block_idx    = lba >> BLOCK_SHIFT;
 	sector_t off_in_block = lba & (SECTORS_PER_BLOCK - 1);
 	sector_t want         = bio_sectors(bio);
@@ -1247,12 +1504,23 @@ static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 		if (pba == PBA_UNMAPPED) {
 			if (next != PBA_UNMAPPED)
 				break;
-		} else if (next != pba + (i << BLOCK_SHIFT)) {
+		} else if (next != pba + (i << BLOCK_SHIFT) ||
+			   zidx_of(c, next) != zidx_of(c, pba)) {
+			/* 한 bio 는 zone 하나에만 걸리게 한다 (rd_inflight 가 zone 별) */
 			break;
 		}
 
 		run += SECTORS_PER_BLOCK;
 		i++;
+	}
+
+	/* GC 가 이 zone 을 reset 하기 전에 이 읽기가 끝나기를 기다릴 수 있게 */
+	if (pba != PBA_UNMAPPED) {
+		struct zns_pio *pio = zns_pio(bio);
+
+		pio->zidx  = (int)zidx_of(c, pba);
+		pio->write = false;
+		atomic_inc(&c->zones[pio->zidx].rd_inflight);
 	}
 
 	spin_unlock_irqrestore(&c->map_lock, flags);
@@ -1279,6 +1547,8 @@ static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
+
+	zns_pio(bio)->zidx = -1;	/* .end_io 가 되돌릴 것이 없음 */
 
 	if (bio->bi_opf & REQ_PREFLUSH) {
 		bio_set_dev(bio, c->dev->bdev);
@@ -1307,7 +1577,26 @@ static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	struct zns_base_c *c = ti->private;
 
 	zns_limits_clear_zoned(limits);
-	limits->chunk_sectors = bdev_zone_sectors(c->dev->bdev);
+	limits->chunk_sectors = c->zone_sectors;
+
+	/* 매핑 단위가 4 KiB 블록이므로 그보다 작은 I/O 는 받지 않는다 */
+	limits->logical_block_size  = SECTORS_PER_BLOCK << SECTOR_SHIFT;
+	limits->physical_block_size = SECTORS_PER_BLOCK << SECTOR_SHIFT;
+	limits->io_min              = SECTORS_PER_BLOCK << SECTOR_SHIFT;
+}
+
+/*
+ * 하위 장치의 한도를 위로 쌓게 한다. 이게 없으면 DM 코어가 io_hints 를
+ * 부르지 않는 커널이 있다(5.15). 위쪽의 zoned 광고는 io_hints 가 지운다.
+ * 보고하는 범위는 실제로 쓰는 zone 정수배 구간이다 — DM 은 zoned 장치의
+ * 범위가 zone 경계에 맞지 않으면 테이블을 거부한다.
+ */
+static int zns_base_iterate_devices(struct dm_target *ti,
+				    iterate_devices_callout_fn fn, void *data)
+{
+	struct zns_base_c *c = ti->private;
+
+	return fn(ti, c->dev, 0, c->total_sectors, data);
 }
 
 /* ==================================================================
@@ -1317,9 +1606,12 @@ static void zns_base_io_hints(struct dm_target *ti, struct queue_limits *limits)
  *   0 <len> zns-base <used> <total> <free_zones> <nr_zones> <valid_blk>
  *                    <gc_runs> <migrated> <mem_n> <nr_runs> <flushes>
  *                    <compactions> <dropped>
+ *                    <write_err> <order_viol> <queued_kib>
  *
  *   used: FREE 가 아닌 zone 의 점유 섹터 합 (FULL 은 zone 통째,
  *         ACTIVE 는 wp 까지). GC 가 zone 을 회수하면 줄어든다.
+ *   write_err: 하위가 거절한 사용자 쓰기.  order_viol: 0 이어야 한다.
+ *   queued_kib: 할당됐지만 아직 완료되지 않은 사용자 쓰기.
  *
  *   $ dmsetup message X 0 gc <zone|auto>   — GC 강제 실행 (테스트용)
  *   $ dmsetup message X 0 zones            — zone 별 state:valid 덤프
@@ -1335,7 +1627,7 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	sector_t used = 0;
 	u64 valid = 0;
 	unsigned int i, mem_n, nr_runs, free_zones;
-	u64 fl, cp, dr, gc, mig;
+	u64 fl, cp, dr, gc, mig, werr, oviol;
 
 	switch (type) {
 	case STATUSTYPE_INFO:
@@ -1357,9 +1649,11 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		dr = c->stat_dropped;
 		gc = c->stat_gc_runs;
 		mig = c->stat_migrated;
+		werr = c->stat_write_err;
+		oviol = READ_ONCE(c->stat_order_viol);
 		spin_unlock_irqrestore(&c->map_lock, flags);
 
-		DMEMIT("%llu %llu %u %u %llu %llu %llu %u %u %llu %llu %llu",
+		DMEMIT("%llu %llu %u %u %llu %llu %llu %u %u %llu %llu %llu %llu %llu %llu",
 		       (unsigned long long)used,
 		       (unsigned long long)c->total_sectors,
 		       free_zones, c->nr_zones,
@@ -1369,7 +1663,10 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		       mem_n, nr_runs,
 		       (unsigned long long)fl,
 		       (unsigned long long)cp,
-		       (unsigned long long)dr);
+		       (unsigned long long)dr,
+		       (unsigned long long)werr,
+		       (unsigned long long)oviol,
+		       (unsigned long long)(atomic64_read(&c->queued_bytes) >> 10));
 		break;
 	case STATUSTYPE_TABLE:
 		DMEMIT("%s", c->dev->name);
@@ -1422,13 +1719,19 @@ static int zns_base_message(struct dm_target *ti, unsigned int argc,
 
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
-	.version         = {0, 4, 0},
-	.features        = 0,
+	.version         = {0, 5, 0},
+	/*
+	 * zoned 하위 장치를 받되 위쪽은 zoned 가 아니다(io_hints 가 지운다).
+	 * 이 플래그가 없으면 DM 이 zoned 모델 불일치로 테이블을 거부한다.
+	 */
+	.features        = DM_TARGET_MIXED_ZONED_MODEL,
 	.module          = THIS_MODULE,
 	.ctr             = zns_base_ctr,
 	.dtr             = zns_base_dtr,
 	.map             = zns_base_map,
+	.end_io          = zns_base_end_io,
 	.io_hints        = zns_base_io_hints,
+	.iterate_devices = zns_base_iterate_devices,
 	.status          = zns_base_status,
 	.message         = zns_base_message,
 };
