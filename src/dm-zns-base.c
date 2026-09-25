@@ -19,7 +19,8 @@
  *
  *   조회:   MemTable(rbtree) → run[0](최신) → run[1] → ... → 없으면 unmapped
  *   flush:  MemTable 이 차면 중위 순회로 "정렬된 불변 run" 하나를 만든다
- *   컴팩션: run 이 쌓이면 하나로 병합. 같은 LBA 는 최신 것만 남는다.
+ *   컴팩션: 최신 run 들을 크기 계층형으로 병합(전용 워커). 같은 LBA 는
+ *           최신 것만 남는다.
  *
  * ── zone 관리 ───────────────────────────────────────────────────────
  *
@@ -220,6 +221,11 @@ struct zns_base_c {
 	struct list_head	 runs;		/* 최신이 head */
 	unsigned int		 nr_runs;
 	bool			 compacting;	/* 컴팩션/GC 스캔 상호 배제 */
+	wait_queue_head_t	 compact_done;	/* compacting 이 풀리면 깨운다 */
+	struct workqueue_struct	*compact_wq;
+	struct work_struct	 compact_work;
+	unsigned int		 compact_idle_runs; /* 병합할 게 없던 run 수 */
+	atomic_t		 gc_waiting;	/* compacting 이 풀리기를 기다리는 GC */
 
 	/* --- 순서 보장 제출 --- */
 	struct bio_list	 sub_list;	/* map_lock. 사용자 쓰기, 할당 순서 그대로 */
@@ -445,118 +451,203 @@ static void zns_refill_spares(struct zns_base_c *c)
 }
 
 /* ==================================================================
- * 컴팩션 — run 여러 개를 하나로 병합
+ * 컴팩션 — 최신 run 몇 개를 하나로 병합 (크기 계층형)
+ *
+ * 매번 run 전부를 병합하면 한 번에 인덱스 전체(수백만 항목)를 다시 쓰고,
+ * 그 사이 쌓인 run 때문에 다음 병합은 더 커진다. 대신 최신 run 부터 모으다가
+ * 다음(더 오래된) run 이 지금까지 모은 양의 COMPACT_GROWTH 배보다 크면
+ * 멈춘다. run 크기가 기하급수로 커지는 층을 이루므로, 항목 하나가 다시
+ * 쓰이는 횟수와 run 수가 모두 O(log N) 이다. 병합 결과는 병합한 run 들의
+ * 자리에 들어가므로, 더 오래된 run 에 남은 같은 LBA 항목은 새 run 이 가린다.
+ *
+ * 병합은 전용 워커에서 돈다. 쓰기 경로에서 돌면 그 쓰기가 병합 시간만큼
+ * 멈추고, 끝날 때까지 CPU 를 놓지 않는다.
  * ================================================================== */
 
+#define COMPACT_GROWTH	2U
+/*
+ * run 이 이보다 많으면 크기 규칙을 무시하고 병합한다(조회 비용 상한).
+ * 이때도 가장 오래된 run 은 뺀다 — 인덱스 대부분을 담고 있어, 넣으면 매번
+ * 인덱스 전체를 다시 쓰고 그 사이 쌓인 run 때문에 또 강제 병합이 걸린다.
+ */
+#define RUNS_FORCE_ALL	32U
+/* 병합 한 번의 항목 수 상한 (16 B × 32M = 512 MiB, kvmalloc 의 INT_MAX 아래) */
+#define MERGE_MAX_ENTRIES	(32U << 20)
+
+struct zns_heap_ent {
+	sector_t	lba;
+	unsigned int	ri;	/* snap 인덱스 — 작을수록 최신 */
+};
+
+static inline bool heap_less(const struct zns_heap_ent *a,
+			     const struct zns_heap_ent *b)
+{
+	return a->lba < b->lba || (a->lba == b->lba && a->ri < b->ri);
+}
+
+static void heap_sift_down(struct zns_heap_ent *h, unsigned int n,
+			   unsigned int i)
+{
+	for (;;) {
+		unsigned int l = 2 * i + 1, r = l + 1, m = i;
+
+		if (l < n && heap_less(&h[l], &h[m]))
+			m = l;
+		if (r < n && heap_less(&h[r], &h[m]))
+			m = r;
+		if (m == i)
+			return;
+		swap(h[i], h[m]);
+		i = m;
+	}
+}
+
+/*
+ * snap[0] 이 가장 최신. 같은 LBA 는 최신 run 의 것만 남긴다.
+ * (lba, run) 순 최소 힙으로 k-way 병합 — O(total · log k). sleepable.
+ */
 static struct zns_ent *zns_merge_runs(struct zns_run **snap, unsigned int k,
 				      unsigned int *out_n, u64 *dropped)
 {
+	struct zns_heap_ent *h;
 	struct zns_ent *out;
 	unsigned int *pos;
-	unsigned int total = 0, n = 0, i;
+	unsigned int total = 0, n = 0, hn = 0, i;
+	unsigned long steps = 0;
 	u64 drop = 0;
 
+	*out_n = 0;
+	*dropped = 0;
 	for (i = 0; i < k; i++)
 		total += snap[i]->n;
-
-	if (!total) {
-		*out_n = 0;
-		*dropped = 0;
+	if (!total)
 		return NULL;
-	}
 
 	out = zns_kvmalloc_array(total, sizeof(*out), GFP_NOIO);
-	if (!out)
-		return NULL;
-
 	pos = kcalloc(k, sizeof(*pos), GFP_NOIO);
-	if (!pos) {
+	h   = kmalloc_array(k, sizeof(*h), GFP_NOIO);
+	if (!out || !pos || !h) {
 		kvfree(out);
+		kfree(pos);
+		kfree(h);
 		return NULL;
 	}
 
-	for (;;) {
-		sector_t best_lba = 0;
-		int best = -1;
+	for (i = 0; i < k; i++) {
+		if (!snap[i]->n)
+			continue;
+		h[hn].lba = snap[i]->ents[0].lba_blk;
+		h[hn].ri  = i;
+		hn++;
+	}
+	for (i = hn / 2; i-- > 0; )
+		heap_sift_down(h, hn, i);
 
-		/* 남은 것들 중 가장 작은 lba_blk. 동률이면 더 최신 run 이 이긴다. */
-		for (i = 0; i < k; i++) {
-			if (pos[i] >= snap[i]->n)
-				continue;
-			if (best < 0 || snap[i]->ents[pos[i]].lba_blk < best_lba) {
-				best = i;
-				best_lba = snap[i]->ents[pos[i]].lba_blk;
+	while (hn) {
+		sector_t lba = h[0].lba;
+		bool first = true;
+
+		/* 이 LBA 를 가진 run 들이 최신 순으로 나온다 — 첫 것만 남긴다 */
+		while (hn && h[0].lba == lba) {
+			unsigned int ri = h[0].ri;
+
+			if (first) {
+				out[n++] = snap[ri]->ents[pos[ri]];
+				first = false;
+			} else {
+				drop++;
 			}
+			if (++pos[ri] < snap[ri]->n)
+				h[0].lba = snap[ri]->ents[pos[ri]].lba_blk;
+			else
+				h[0] = h[--hn];
+			heap_sift_down(h, hn, 0);
 		}
-		if (best < 0)
-			break;
-
-		out[n++] = snap[best]->ents[pos[best]];
-
-		for (i = 0; i < k; i++) {
-			if (pos[i] < snap[i]->n &&
-			    snap[i]->ents[pos[i]].lba_blk == best_lba) {
-				if (i != (unsigned int)best)
-					drop++;
-				pos[i]++;
-			}
-		}
+		if (!(++steps & 0xffff))
+			cond_resched();
 	}
 
 	kfree(pos);
+	kfree(h);
 	*out_n = n;
 	*dropped = drop;
 	return out;
 }
 
-/* 락 밖(sleepable)에서 호출한다. */
-static void zns_maybe_compact(struct zns_base_c *c)
+/*
+ * 병합 한 번. 병합했으면 true (더 할 게 있을 수 있다).
+ *
+ * compacting 은 GC 의 인덱스 스캔과의 상호 배제를 겸한다 — GC 도 run 배열을
+ * 락 밖에서 읽으므로, 병합이 끝난 run 을 kvfree 하는 것과 겹치면 안 된다.
+ * 풀 때마다 compact_done 을 깨운다.
+ */
+static bool zns_compact_step(struct zns_base_c *c)
 {
 	struct zns_run **snap = NULL;
 	struct zns_run *merged = NULL;
 	struct zns_run *r;
 	struct zns_ent *ents;
 	struct list_head *anchor;
-	unsigned int k = 0, i, n = 0;
+	unsigned int cap, k = 0, i, n = 0;
 	unsigned long flags;
-	u64 dropped = 0;
+	u64 dropped = 0, sum = 0;
+	bool force;
 
 	spin_lock_irqsave(&c->map_lock, flags);
-	if (c->compacting || c->nr_runs < RUNS_COMPACT_AT) {
+	/* GC 가 기다리고 있으면 양보한다 — 병합을 연달아 잡으면 GC 가 굶는다 */
+	if (c->compacting || c->nr_runs < RUNS_COMPACT_AT ||
+	    atomic_read(&c->gc_waiting)) {
 		spin_unlock_irqrestore(&c->map_lock, flags);
-		return;
+		return false;
 	}
 	c->compacting = true;
-	k = c->nr_runs;
+	cap = c->nr_runs;
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
-	snap   = kcalloc(k, sizeof(*snap), GFP_NOIO);
+	snap   = kcalloc(cap, sizeof(*snap), GFP_NOIO);
 	merged = kzalloc(sizeof(*merged), GFP_NOIO);
 	if (!snap || !merged)
 		goto out_abort;
 
 	/*
-	 * run 은 불변이고 리스트 앞쪽에만 추가된다. 여기서 앞에서부터 k 개를
-	 * 적어두면 병합하는 동안 새 run 이 앞에 붙어도 적어둔 것은 그대로다.
-	 * compacting 플래그가 GC 스캔과의 상호 배제도 겸한다 — GC 도 run
-	 * 포인터를 락 밖에서 참조하므로, 컴팩션의 kvfree 와 겹치면 안 된다.
+	 * run 은 불변이고 리스트 앞쪽에만 추가된다. 앞에서부터 고른 k 개는
+	 * 병합하는 동안 새 run 이 앞에 붙어도 그대로이고 연속해 있다.
 	 */
 	spin_lock_irqsave(&c->map_lock, flags);
-	i = 0;
+	force = c->nr_runs > RUNS_FORCE_ALL;
 	list_for_each_entry(r, &c->runs, list) {
-		if (i >= k)
+		if (k >= cap)
 			break;
-		snap[i++] = r;
+		if (force) {
+			if (list_is_last(&r->list, &c->runs))
+				break;
+		} else if (k >= 1 && r->n > COMPACT_GROWTH * sum) {
+			break;
+		}
+		if (k >= 2 && sum + r->n > MERGE_MAX_ENTRIES)
+			break;
+		sum += r->n;
+		snap[k++] = r;
 	}
-	k = i;
+	if (k < 2)
+		c->compact_idle_runs = c->nr_runs;	/* 다음 flush 까지 할 일 없음 */
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
 	if (k < 2)
 		goto out_abort;
 
-	ents = zns_merge_runs(snap, k, &n, &dropped);
-	if (!ents)
+	/* 할당이 안 되면 가장 오래된 것부터 빼며 더 작게 병합한다 */
+	for (ents = NULL; k >= 2; k--) {
+		ents = zns_merge_runs(snap, k, &n, &dropped);
+		if (ents)
+			break;
+	}
+	if (!ents) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		c->compact_idle_runs = c->nr_runs;	/* 다음 flush 까지 재시도 안 함 */
+		spin_unlock_irqrestore(&c->map_lock, flags);
 		goto out_abort;
+	}
 
 	merged->ents = ents;
 	merged->n    = n;
@@ -573,6 +664,7 @@ static void zns_maybe_compact(struct zns_base_c *c)
 	c->stat_dropped += dropped;
 	c->compacting = false;
 	spin_unlock_irqrestore(&c->map_lock, flags);
+	wake_up_all(&c->compact_done);
 
 	DMDEBUG("compact: %u runs -> %u entries, %llu dropped",
 		k, n, (unsigned long long)dropped);
@@ -582,14 +674,33 @@ static void zns_maybe_compact(struct zns_base_c *c)
 		kfree(snap[i]);
 	}
 	kfree(snap);
-	return;
+	return true;
 
 out_abort:
 	spin_lock_irqsave(&c->map_lock, flags);
 	c->compacting = false;
 	spin_unlock_irqrestore(&c->map_lock, flags);
+	wake_up_all(&c->compact_done);
 	kfree(snap);
 	kfree(merged);
+	return false;
+}
+
+static void zns_compact_workfn(struct work_struct *w)
+{
+	struct zns_base_c *c = container_of(w, struct zns_base_c, compact_work);
+
+	while (zns_compact_step(c))
+		cond_resched();
+}
+
+/* 락 없이 불러도 된다. 할 일이 있을 때만 워커를 깨운다. */
+static void zns_kick_compact(struct zns_base_c *c)
+{
+	unsigned int runs = READ_ONCE(c->nr_runs);
+
+	if (runs >= RUNS_COMPACT_AT && runs != READ_ONCE(c->compact_idle_runs))
+		queue_work(c->compact_wq, &c->compact_work);
 }
 
 /* ==================================================================
@@ -722,7 +833,7 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	sector_t vstart, vend;
 	unsigned int mem_n = 0, k = 0, kmax, ncand = 0, ci;
 	unsigned int max_cand;
-	int vidx, ret = 0, tries, restarts = 0;
+	int vidx, ret = 0, restarts = 0;
 
 	/* ---- 스냅샷용 메모리 (락 밖 선할당) ---- */
 	max_cand = (unsigned int)(c->zone_sectors >> BLOCK_SHIFT);
@@ -737,20 +848,18 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	/*
 	 * 스냅 단계는 컴팩션과 상호 배제한다(compacting 플래그).
 	 * 컴팩션이 run 을 kvfree 하는 동안 우리가 그 run 배열을 락 밖에서
-	 * 스캔하면 use-after-free 다.
+	 * 스캔하면 use-after-free 다. 병합 한 번이 끝날 때까지 기다린다.
 	 */
 restart:
-	for (tries = 0; ; tries++) {
+	atomic_inc(&c->gc_waiting);	/* 컴팩션 워커가 다음 병합을 잡지 않게 */
+	for (;;) {
 		spin_lock_irqsave(&c->map_lock, flags);
 		if (!c->compacting)
 			break;
 		spin_unlock_irqrestore(&c->map_lock, flags);
-		if (tries > 1000) {
-			ret = -EBUSY;
-			goto out;
-		}
-		usleep_range(100, 200);
+		wait_event(c->compact_done, !READ_ONCE(c->compacting));
 	}
+	atomic_dec(&c->gc_waiting);
 	/* 여기부터 map_lock 보유 + compacting 선점 */
 	c->compacting = true;
 
@@ -942,6 +1051,10 @@ restart:
 			c->stat_migrated++;
 		}
 		spin_unlock_irqrestore(&c->map_lock, flags);
+
+		/* 이주도 MemTable 을 채워 run 을 만든다 */
+		if ((ci & (MEMTABLE_MAX - 1)) == MEMTABLE_MAX - 1)
+			zns_kick_compact(c);
 	}
 
 do_reset:
@@ -1000,6 +1113,7 @@ out:
 	kvfree(cand);
 	if (pg)
 		__free_page(pg);
+	zns_kick_compact(c);	/* GC 에 양보했던 병합을 이어서 */
 	return ret;
 }
 
@@ -1040,6 +1154,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_init(&c->gc_lock);
 	INIT_WORK(&c->gc_work, zns_gc_workfn);
 	INIT_WORK(&c->sub_work, zns_sub_workfn);
+	INIT_WORK(&c->compact_work, zns_compact_workfn);
+	init_waitqueue_head(&c->compact_done);
 	bio_list_init(&c->sub_list);
 	atomic64_set(&c->queued_bytes, 0);
 	init_waitqueue_head(&c->admit_wq);
@@ -1058,7 +1174,8 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	/* 쓰기 진행이 GC 와 제출 워커에 달려 있으므로 메모리 압박에서도 굴러야 한다 */
 	c->gc_wq  = alloc_workqueue("zns-gc", WQ_MEM_RECLAIM, 1);
 	c->sub_wq = alloc_ordered_workqueue("zns-sub", WQ_MEM_RECLAIM | WQ_HIGHPRI);
-	if (!c->gc_wq || !c->sub_wq) {
+	c->compact_wq = alloc_ordered_workqueue("zns-compact", WQ_MEM_RECLAIM);
+	if (!c->gc_wq || !c->sub_wq || !c->compact_wq) {
 		ti->error = "cannot create workqueues";
 		ret = -ENOMEM;
 		goto err_wq;
@@ -1175,6 +1292,8 @@ err_dev:
 err_bs:
 	bioset_exit(&c->gc_bs);
 err_wq:
+	if (c->compact_wq)
+		destroy_workqueue(c->compact_wq);
 	if (c->sub_wq)
 		destroy_workqueue(c->sub_wq);
 	if (c->gc_wq)
@@ -1192,6 +1311,7 @@ static void zns_base_dtr(struct dm_target *ti)
 	/* dtr 시점엔 진행 중 I/O 가 없다(DM 보장). 남은 작업만 끝내고 내린다. */
 	destroy_workqueue(c->sub_wq);
 	destroy_workqueue(c->gc_wq);
+	destroy_workqueue(c->compact_wq);	/* GC 뒤 — GC 가 컴팩션을 기다릴 수 있다 */
 	bioset_exit(&c->gc_bs);
 
 	list_for_each_entry_safe(r, tmp, &c->runs, list) {
@@ -1416,7 +1536,7 @@ again:
 		zns_refill_spares(c);
 	if (low_free)
 		queue_work(c->gc_wq, &c->gc_work);	/* 선제 GC — 비동기 */
-	zns_maybe_compact(c);
+	zns_kick_compact(c);
 
 	return DM_MAPIO_SUBMITTED;
 
