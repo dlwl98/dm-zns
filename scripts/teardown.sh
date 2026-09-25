@@ -10,7 +10,7 @@
 #   null_blk
 #
 # 거꾸로 하면 커널이 "사용 중"으로 거부하고, null_blk 이 어중간하게 남아
-# 환경을 다시 만들 수 없게 된다. (6월 보고서 질문사항 → 조교 답변)
+# 환경을 다시 만들 수 없게 된다.
 #
 # 사용:  sudo bash scripts/teardown.sh
 set -uo pipefail

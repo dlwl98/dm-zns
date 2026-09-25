@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Phase 3 / M2 — ext4 라운드트립.
-#
-# M1 위에 실제 파일시스템을 얹는다. 코드를 더하는 단계라기보다,
-# M1 이 진짜로 맞게 동작하는지 파일시스템으로 검증하는 단계다.
+# Phase 3 / M2 — ext4 라운드트립: mkfs → 쓰기 → umount/remount → md5 + e2fsck.
 #
 #   umount / remount 사이에 md5 를 비교하는 이유는 페이지 캐시 우회다.
 #   안 그러면 DM 을 거치지 않고 RAM 에서 곧장 읽혀 "정상"이라는
@@ -49,12 +46,12 @@ teardown() {
 	umount "$MNT" 2>/dev/null
 	dmsetup remove "$DM_NAME" 2>/dev/null
 	rmmod "$MOD_NAME" 2>/dev/null
-	bash scripts/nullblk-down.sh >/dev/null 2>&1
+	zns_under_down >/dev/null 2>&1
 }
 
 step "0. 환경 구성"
 teardown
-bash scripts/nullblk-up.sh >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
+zns_under_up >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
 zns_load_module "$MOD_KO" || exit 1
 SECTORS=$(blockdev --getsz "$UNDERLYING")
 echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" \
@@ -129,9 +126,6 @@ echo "  최종 소모: $(usage)"
 echo "  통과 $pass / 실패 $fail"
 [ $fail -eq 0 ] && echo "  >>> M2 PASSED <<<" || echo "  >>> 실패 항목 있음 <<<"
 
-echo
-echo "  GC 가 없으므로 위 소모량은 되돌아오지 않는다. 논리적으로 같은 자리를"
-echo "  덮어써도 물리 공간은 계속 줄어든다 — M3 이 회수할 몫이다."
 
 step "정리"
 bash scripts/teardown.sh

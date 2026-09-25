@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 1 검증 — 커널 6.17 포팅이 6·7월 결과를 재현하는지 확인한다.
+# Phase 1 검증 — M1: 임의 쓰기가 하위 zoned 장치에서 거절되지 않는가.
 #
-#   1) teardown (dm 타깃 → null_blk 순서)
-#   2) nullblk 기동 + 모듈 적재 + dm 타깃 생성
-#   3) 위쪽 면이 conventional 로 광고되는지 확인   ← 이번에 새로 보는 것
+#   1) teardown (dm 타깃 → 하위 장치 순서)
+#   2) 하위 장치 준비 + 모듈 적재 + dm 타깃 생성
+#   3) 위쪽 면이 conventional 로 광고되는지 확인
 #   4) fio 4K randwrite 100MB, blk_update_request 증가분(delta) 측정
 #
 # 사용:  sudo bash scripts/phase1-verify.sh
@@ -27,17 +27,17 @@ step() { echo; echo "=== $* ==="; }
 
 # ---------------------------------------------------------------- 1. teardown
 # 순서 중요: dm 타깃이 살아 있으면 device mapper 가 하위 디바이스를 계속
-# 참조하므로 null_blk 이 내려가지 않는다. (6월 보고서 질문사항)
+# 참조하므로 null_blk 이 내려가지 않는다.
 step "1. 이전 잔재 정리"
 umount /mnt/x 2>/dev/null && echo "  umount /mnt/x"
 dmsetup remove "$DM_NAME" 2>/dev/null && echo "  dmsetup remove $DM_NAME"
 rmmod "$MOD_NAME" 2>/dev/null && echo "  rmmod $MOD_NAME"
-bash scripts/nullblk-down.sh >/dev/null 2>&1 && echo "  nullblk down"
+zns_under_down >/dev/null 2>&1 && echo "  nullblk down"
 echo "  정리 완료"
 
 # ---------------------------------------------------------------- 2. 셋업
 step "2. 환경 구성"
-bash scripts/nullblk-up.sh || { echo "nullblk-up 실패" >&2; exit 1; }
+zns_under_up || { echo "nullblk-up 실패" >&2; exit 1; }
 
 zns_load_module "$MOD_KO" || exit 1
 echo "  모듈 적재 OK (src/dm-zns-base.ko 와 srcversion 일치 확인)"

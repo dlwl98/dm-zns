@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Phase 4 — 매핑을 평면 배열에서 LSM-Tree 로 바꾼 뒤의 검증.
+# Phase 4 — LSM-Tree 인덱스 검증.
 #
-#   T1  정확성 회귀 — 큰 읽기 == 작은 읽기
-#   T2  정확성 회귀 — crc32c 왕복
-#   T3  LSM 이 실제로 도는가 — flush / compaction 발생
-#   T4  컴팩션이 죽은 매핑을 집계하는가 — M3 이 회수할 몫의 정량화
+#   T1  정확성 — 큰 읽기 == 작은 읽기
+#   T2  정확성 — crc32c 왕복
+#   T3  flush / compaction 이 일어나는가
+#   T4  컴팩션이 죽은 매핑을 집계하는가 (GC 가 회수할 몫)
 #
-# T1·T2 는 Phase 2 와 같은 검사다. 자료구조를 갈아엎었으므로 회귀부터 본다.
+# T1·T2 는 phase2 와 같은 검사를 인덱스 위에서 다시 본다.
 #
 # 사용:  sudo bash scripts/phase4-verify.sh
 set -uo pipefail
@@ -53,7 +53,7 @@ create_target() {
 
 step "0. 환경 구성"
 bash scripts/teardown.sh >/dev/null 2>&1
-bash scripts/nullblk-up.sh >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
+zns_under_up >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
 zns_load_module "$MOD_KO" || exit 1
 create_target || { echo "dmsetup create 실패"; dmesg | tail -10; exit 1; }
 echo "  $DEV 준비"
@@ -121,14 +121,14 @@ fi
 # =====================================================================
 # T4 — 같은 자리를 반복해서 덮어쓴다.
 #
-#      논리적으로는 계속 같은 64 MiB 인데, GC 가 없으므로 물리 공간은
-#      쓴 만큼 계속 줄어든다. 그 차이가 곧 죽은 데이터이고, 컴팩션이
+#      논리적으로는 계속 같은 64 MiB 인데, 이 양으로는 GC 가 돌지 않으므로
+#      물리 공간은 쓴 만큼 줄어든다. 그 차이가 죽은 데이터이고, 컴팩션이
 #      밀어낸 매핑 수(dropped)가 그것을 집계한다.
 # =====================================================================
 step "T4. 덮어쓰기가 만들어내는 쓰레기를 집계하는가"
 
 bash scripts/teardown.sh >/dev/null 2>&1
-bash scripts/nullblk-up.sh >/dev/null
+zns_under_up >/dev/null
 zns_load_module "$MOD_KO" || exit 1
 create_target
 
@@ -152,11 +152,11 @@ garbage_mb=$(( wp_mb - LIVE_MB ))
 echo
 echo "  소모한 물리 공간 : ${wp_mb} MiB"
 echo "  살아있는 데이터  : ${LIVE_MB} MiB"
-echo "  쓰레기           : ${garbage_mb} MiB   ← M3 의 GC 가 회수할 몫"
+echo "  쓰레기           : ${garbage_mb} MiB   ← GC 가 회수할 몫"
 echo "  집계된 dropped   : ${dropped} 엔트리 = ${dropped_mb} MiB"
 
 if [ "$dropped" -gt 0 ]; then
-	ok "죽은 매핑이 집계된다 — M3 의 valid/invalid 판정이 컴팩션에서 나온다"
+	ok "죽은 매핑이 집계된다 — 컴팩션이 중복 LBA 를 걸러낸다"
 else
 	bad "dropped 가 0 — 컴팩션이 중복을 못 걸러내고 있다"
 fi

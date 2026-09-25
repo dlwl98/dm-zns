@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Phase 2 검증 — M1 이 "쓰기가 거절되지 않는다" 를 넘어 "쓴 데이터가 그대로
-# 읽힌다" 까지 만족하는지 본다. M1 의 원래 성공 기준(delta 0)은 읽기를 아예
-# 하지 않으므로 읽기 경로의 결함을 잡지 못한다.
+# Phase 2 검증 — 쓴 데이터가 그대로 읽히는가. M1 기준(delta 0)은 읽기를
+# 하지 않으므로 읽기 경로는 여기서 본다.
 #
-#   T1  큰 읽기 == 작은 읽기      (멀티블록 read 오매핑)
+#   T1  큰 읽기 == 작은 읽기      (멀티블록 read 매핑)
 #   T2  fio --verify=crc32c       (쓰기→읽기 왕복 무결성)
 #   T3  타깃 재생성               (ctr 의 zone reset)
-#   T4  용량 경계                 (GC 없는 상태에서 ENOSPC)
+#   T4  용량 경계                 (끝을 넘기면 ENOSPC)
 #
 # 사용:  sudo bash scripts/phase2-verify.sh
 set -uo pipefail
@@ -35,7 +34,7 @@ teardown() {
 	umount /mnt/x 2>/dev/null
 	dmsetup remove "$DM_NAME" 2>/dev/null
 	rmmod "$MOD_NAME" 2>/dev/null
-	bash scripts/nullblk-down.sh >/dev/null 2>&1
+	zns_under_down >/dev/null 2>&1
 }
 
 create_target() {
@@ -46,7 +45,7 @@ create_target() {
 
 step "0. 환경 구성"
 teardown
-bash scripts/nullblk-up.sh >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
+zns_under_up >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
 zns_load_module "$MOD_KO" || exit 1
 create_target || { echo "dmsetup create 실패"; dmesg | tail -10; exit 1; }
 echo "  $DEV 준비 완료"
@@ -118,11 +117,20 @@ else
 fi
 
 # =====================================================================
-# T4 — 용량 경계  (GC 가 없으므로 wp 는 되돌아오지 않는다)
+# T4 — 용량 경계
 #     디바이스를 끝까지 채우므로 반드시 마지막에.
+#
+# 노출 용량 = 물리 용량이라, 끝에 닿으면 GC 가 거의 꽉 찬 zone 을 옮기기만
+# 하고 공간을 못 만든다. 쓰기 하나가 GC 를 WRITE_GC_RETRIES 번 기다린 뒤
+# ENOSPC 가 되고, fio 는 continue_on_error 로 남은 쓰기를 계속 낸다.
+# zone 이 작고 I/O 가 빠르면(null_blk) 수 초에 끝나지만, zone 이 크고 GC 가
+# 느린 장치에서는 끝나지 않는다 — P2_T4=0 으로 건너뛴다.
 # =====================================================================
 step "T4. 용량을 넘기면 조용히 새지 않고 끊기는가"
 
+if [ "${P2_T4:-1}" = 0 ]; then
+	echo "  [SKIP] P2_T4=0"
+else
 CAP_MB=$(( $(blockdev --getsz "$UNDERLYING") / 2048 ))
 echo "  디바이스 용량 ${CAP_MB} MiB — 넘겨서 써 본다"
 
@@ -140,10 +148,11 @@ echo "  out-of-space 로그 증가:      $((after_oos - before_oos))"
 echo "  blk_update_request 증가:     $((after_blk - before_blk))"
 
 if [ $((after_oos - before_oos)) -gt 0 ]; then
-	ok "경계에서 ENOSPC 로 끊었다 (의도된 동작 — M3 에서 GC 가 이 자리를 채운다)"
+	ok "경계에서 ENOSPC 로 끊었다 (의도된 동작)"
 	dmesg | grep "zns-base.*out of space" | tail -1 | sed 's/^/         /'
 else
 	bad "경계 검사가 걸리지 않았다"
+fi
 fi
 
 # =====================================================================
