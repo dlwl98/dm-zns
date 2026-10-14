@@ -46,9 +46,7 @@ show_stat() {
 }
 
 create_target() {
-	local sectors
-	sectors=$(blockdev --getsz "$UNDERLYING")
-	echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME"
+	zns_table "$UNDERLYING" format | dmsetup create "$DM_NAME"
 }
 
 step "0. 환경 구성"

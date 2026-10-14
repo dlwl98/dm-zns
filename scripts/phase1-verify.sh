@@ -42,8 +42,8 @@ zns_under_up || { echo "nullblk-up 실패" >&2; exit 1; }
 zns_load_module "$MOD_KO" || exit 1
 echo "  모듈 적재 OK (src/dm-zns-base.ko 와 srcversion 일치 확인)"
 
-SECTORS=$(blockdev --getsz "$UNDERLYING")
-echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" || {
+SECTORS=$(zns_logical_sectors "$UNDERLYING")
+zns_table "$UNDERLYING" format | dmsetup create "$DM_NAME" || {
 	echo "dmsetup create 실패 — 아래 dmesg 참고" >&2
 	dmesg | tail -20
 	exit 1

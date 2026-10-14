@@ -9,9 +9,10 @@
 #   예) bash scripts/run-phases.sh ~/results/run1 1 2 3 4 5
 #       UNDERLYING=/dev/nvme0n1 P2_T4=0 P5_T3=0 bash scripts/run-phases.sh ~/results/run2 1 2 3 4 5
 #
-# sudo 는 환경변수를 버리므로 UNDERLYING / P2_T4 / P5_T3 는 여기서 명시적으로 넘긴다.
+# sudo 는 환경변수를 버리므로 UNDERLYING / P2_T4 / P5_T3 / P6_ITERS 는 여기서 명시적으로 넘긴다.
 set -uo pipefail
-ENV_PASS=(UNDERLYING="${UNDERLYING:-/dev/nullb0}" P2_T4="${P2_T4:-1}" P5_T3="${P5_T3:-1}")
+ENV_PASS=(UNDERLYING="${UNDERLYING:-/dev/nullb0}" P2_T4="${P2_T4:-1}" P5_T3="${P5_T3:-1}"
+	  P6_ITERS="${P6_ITERS:-10}")
 
 OUT=$1; shift
 mkdir -p "$OUT"

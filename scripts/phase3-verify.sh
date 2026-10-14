@@ -53,8 +53,8 @@ step "0. 환경 구성"
 teardown
 zns_under_up >/dev/null || { echo "nullblk-up 실패" >&2; exit 1; }
 zns_load_module "$MOD_KO" || exit 1
-SECTORS=$(blockdev --getsz "$UNDERLYING")
-echo "0 $SECTORS zns-base $UNDERLYING" | dmsetup create "$DM_NAME" \
+SECTORS=$(zns_logical_sectors "$UNDERLYING")
+zns_table "$UNDERLYING" format | dmsetup create "$DM_NAME" \
 	|| { echo "dmsetup create 실패"; dmesg | tail -10; exit 1; }
 echo "  $DEV 준비  (소모 $(usage))"
 

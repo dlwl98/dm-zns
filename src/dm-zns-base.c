@@ -14,6 +14,14 @@
  *   GC     — free zone 이 바닥나면 valid 가 가장 적은 FULL zone 을 골라
  *             살아있는 블록을 활성 zone 으로 이주시키고 zone 을 reset 해
  *             재사용한다.
+ *   META   — 매핑 변경을 마지막 두 zone(메타 zone)의 로그에 기록하고,
+ *             장치를 다시 만들 때 체크포인트 + 로그 재생으로 복구한다.
+ *             위쪽에는 휘발성 쓰기 캐시가 있는 장치로 광고해 flush/FUA 를
+ *             받고, 그 의미를 지킨다('메타데이터' 절).
+ *
+ *   테이블: <dev> [format] [max_util:<permille>]
+ *     format    장치를 지우고 새로 시작. 없으면 메타데이터에서 복구한다.
+ *     max_util  노출 용량 상한 = 데이터 풀 × permille/1000 (기본 750).
  *
  * ── LSM-Tree 인덱스 ─────────────────────────────────────────────────
  *
@@ -25,6 +33,12 @@
  * ── zone 관리 ───────────────────────────────────────────────────────
  *
  *   zone 상태: FREE → ACTIVE(할당 중) → FULL → (GC) → FREE
+ *   마지막 두 zone 은 META 로, 할당과 GC 의 대상이 아니다.
+ *
+ *   노출 용량: 데이터 zone N 개 중 활성 둘(사용자, GC)을 뺀 풀 P = N - 2.
+ *   논리 크기 L 이 P·zone 보다 작아야 GC 가 언제나 빈 공간을 만든다(가득 찬
+ *   zone 만 옮기며 헛도는 livelock 이 없다). 기본은 L ≤ 3/4·P·zone 으로,
+ *   GC 몇 번 안에 공간이 생긴다.
  *
  *   하위 ZNS 는 zone 별 wp 위치의 쓰기만 받으므로, 한 zone 에 대한 쓰기는
  *   할당 순서대로 장치에 도착해야 한다. 그래서 zone 마다 제출자를 하나로
@@ -69,12 +83,14 @@
  *   reclaim 을 워커로 빼는 이유가 이것이다.
  *
  * 한계(stretch / 알려진 것):
- *   - 매핑 영속화 / crash recovery 없음.
  *   - GC 이주는 4 KiB 동기 I/O 페어(submit_bio_wait).
+ *   - 테이블을 살아 있는 채로 바꾸는 reload 는 지원하지 않는다 — 새 타깃이
+ *     복구한 뒤에 옛 타깃이 마지막 커밋을 쓸 수 있다.
  *   - 사용자 쓰기는 활성 zone 하나에 제출자 하나라 장치 기준 zone 당 QD 1.
- *   - 거절된 쓰기의 매핑은 되돌리지 않는다(쓰이지 않은 PBA 를 가리킨 채
- *     남는다). 상위는 이미 EIO 를 받았다. 마감 전에 그 zone 에 할당된 뒤쪽
- *     쓰기들도 같이 거절된다.
+ *   - 데이터 쓰기가 하나라도 거절되면 fail-stop 이다: 메타 기록을 멈추고
+ *     이후 쓰기·flush 는 EIO. 거절된 쓰기의 메모리 매핑을 되돌리지 못하기
+ *     때문이다(장치의 매핑은 마지막 커밋에 머물러 일관적이다). 매핑을
+ *     무효화하는 tombstone 이 생기면 계속 쓸 수 있게 바꿀 수 있다.
  *   - zone capacity 가 zone size 보다 작은 장치는 지원하지 않는다(쓰기 한도를
  *     zone size 로 잡는다).
  *   - 일찍 마감한 zone 에 ZONE_FINISH 를 보내지 않는다 — active zone 수에
@@ -97,6 +113,8 @@
 #include <linux/delay.h>
 #include <linux/highmem.h>
 #include <linux/workqueue.h>
+#include <linux/crc32.h>
+#include <linux/ktime.h>
 
 #include "zns-compat.h"	/* 5.15 / 6.17 API 차이 */
 
@@ -137,6 +155,73 @@
 #define ZNS_QUEUE_MAX_BYTES	(32ULL << 20)
 /* GC 가 victim 의 진행 중 I/O 를 기다리는 최대 시간 */
 #define ZNS_QUIESCE_TIMEOUT	(30 * HZ)
+/* 노출 용량 상한의 기본값 (permille) */
+#define ZNS_DEFAULT_MAX_UTIL	750U
+
+/* ── 메타데이터 ── */
+#define ZNS_META_ZONES		2U		/* 마지막 두 zone */
+#define ZNS_MD_MAGIC		0x4d534e5aU	/* "ZNSM" */
+#define ZNS_MD_VERSION		1U
+#define ZNS_MD_BLK		4096U
+#define ZNS_MD_BATCH		256U		/* 한 번에 읽고 쓰는 메타 블록 수 (1 MiB) */
+/* 마지막 체크포인트 뒤 로그가 이만큼(128 MiB) 쌓이면 다음 커밋을 체크포인트로 — 복구 시간 상한 */
+#define ZNS_LOG_CKPT_BLOCKS	32768U
+/* 커밋 전 레코드 링. 사용자 쓰기는 GC 몫을 남기고 멈춘다. */
+#define ZNS_RING_ORDER		18U
+#define ZNS_RING_GC_HEADROOM	4096U
+/* flush 가 없어도 이 간격으로 커밋한다 */
+#define ZNS_LOG_TICK		(HZ)
+
+enum zns_md_type {
+	ZNS_MD_SB = 1,		/* 세대 시작 */
+	ZNS_MD_CKPT,		/* 체크포인트 매핑 (lba 순) */
+	ZNS_MD_CKPT_END,	/* 체크포인트 끝 — 이게 있어야 세대가 유효 */
+	ZNS_MD_LOG,		/* 체크포인트 뒤의 매핑 변경 */
+};
+
+/* 메타 블록 머리 (on-disk, little-endian) */
+struct zns_md_hdr {
+	__le32	magic;
+	__le32	type;
+	__le64	gen;
+	__le64	seq;	/* 메타 zone 안의 블록 번호 (SB = 0) */
+	__le32	crc;	/* 블록 전체의 crc32, 이 칸은 0 으로 두고 계산 */
+	__le32	count;	/* 블록 안 항목 수 (CKPT_END: 체크포인트 블록 수) */
+	__le64	aux;	/* CKPT: 첫 항목 번호, CKPT_END: 총 항목 수, LOG: 첫 레코드 번호 */
+};
+
+struct zns_md_sb {
+	__le32	version;
+	__le32	nr_zones;
+	__le64	zone_sectors;
+	__le64	logical_blocks;
+};
+
+/* 체크포인트 항목 / 로그 레코드. 주소는 4 KiB 블록 단위. */
+struct zns_md_ent {
+	__le32	lba;
+	__le32	pba;
+};
+
+struct zns_md_rec {
+	__le32	lba;
+	__le32	pba;
+	__le32	len;
+	__le32	flags;
+};
+
+#define ZNS_MD_BODY		(ZNS_MD_BLK - sizeof(struct zns_md_hdr))
+#define ZNS_ENTS_PER_BLK	((unsigned int)(ZNS_MD_BODY / sizeof(struct zns_md_ent)))
+#define ZNS_RECS_PER_BLK	((unsigned int)(ZNS_MD_BODY / sizeof(struct zns_md_rec)))
+
+/* 커밋 전 매핑 변경 한 건 (extent). 블록 단위. */
+struct zns_rec {
+	u32	lba;
+	u32	pba;
+	u32	len;
+	u32	flags;
+};
+#define ZNS_REC_VOID		1U	/* 쓰기가 실패했다 — 기록하지 않는다 */
 
 /* ------------------------------------------------------------------ *
  * 자료구조                                                             *
@@ -159,12 +244,14 @@ struct zns_run {
 	struct list_head list;	/* c->runs — head 가 최신 */
 	struct zns_ent  *ents;	/* lba_blk 오름차순 */
 	unsigned int	 n;
+	unsigned int	 cap;	/* ents 의 할당 크기 (메모리 통계) */
 };
 
 enum zns_zone_state {
 	ZNS_ZONE_FREE = 0,
 	ZNS_ZONE_ACTIVE,
 	ZNS_ZONE_FULL,
+	ZNS_ZONE_META,
 };
 
 struct zns_zone {
@@ -177,13 +264,19 @@ struct zns_zone {
 	atomic_t	rd_inflight;	/* 이 zone 으로 remap 된 진행 중 읽기 */
 };
 
+struct zns_base_c;
+
 /*
  * bio 별 상태 (ti->per_io_data_size). .map 입구에서 zidx = -1 로 초기화하고,
  * zone 에 걸린 I/O 만 zidx 를 채운다. .end_io 는 zidx 로 뒷정리를 한다.
  */
 struct zns_pio {
+	struct zns_base_c *c;	/* FUA 복제본의 완료 콜백이 쓴다 */
+	u64		rec_seq;	/* 이 쓰기의 매핑 레코드 번호 */
 	int		zidx;
 	bool		write;
+	bool		fua;
+	u8		epoch;	/* 커밋이 기다리는 쓰기 묶음 (0/1) */
 	unsigned int	bytes;	/* 입장 제어에 잡힌 쓰기 크기 */
 };
 
@@ -199,11 +292,12 @@ struct zns_cand {
 struct zns_base_c {
 	struct dm_dev	*dev;
 
-	spinlock_t	 map_lock;	/* 인덱스 + zone 배열 보호 */
-	sector_t	 total_sectors;	/* nr_zones * zone_sectors */
-	sector_t	 total_blocks;
+	spinlock_t	 map_lock;	/* 인덱스 + zone 배열 + 레코드 링 보호 */
+	sector_t	 total_sectors;	/* nr_zones * zone_sectors (메타 zone 포함) */
+	sector_t	 total_blocks;	/* 논리(노출) 크기, 블록 */
 	sector_t	 zone_sectors;
-	unsigned int	 nr_zones;
+	unsigned int	 nr_zones;	/* 하위 장치의 zone 전부 */
+	unsigned int	 data_zones;	/* 앞쪽 데이터 zone 수 (뒤 ZNS_META_ZONES 개는 메타) */
 
 	/* --- zone --- */
 	struct zns_zone	*zones;
@@ -242,7 +336,41 @@ struct zns_base_c {
 	struct work_struct	 gc_work;
 	struct bio_set	 gc_bs;		/* GC I/O 전용 — 상위와 풀을 나눠 쓰지 않는다 */
 
+	/* --- 메타데이터: 기록 위치 (log_lock) --- */
+	struct mutex	 log_lock;	/* 커밋·체크포인트 직렬화 */
+	unsigned int	 md_cur;	/* 지금 쓰는 메타 zone (0/1) */
+	u64		 md_gen;	/* 그 zone 의 세대 */
+	u64		 md_seq;	/* 다음 메타 블록 번호 */
+	sector_t	 md_wp;		/* 다음 메타 블록 위치 */
+	unsigned int	 md_log_blocks;	/* 마지막 체크포인트 뒤 로그 블록 수 */
+	bool		 md_err;	/* fail-stop: 메타 기록이나 데이터 쓰기 실패 — 이후 쓰기·flush 는 EIO */
+	struct page	*md_pages[ZNS_MD_BATCH];
+	struct bio_set	 md_bs;
+
+	/* --- 메타데이터: 커밋 전 레코드 (map_lock) --- */
+	struct zns_rec	*ring;		/* 매핑 변경, 할당 순서 그대로 */
+	u64		 ring_cap;	/* 2 의 거듭제곱 */
+	u64		 rec_next;	/* 다음 레코드 번호 */
+	u64		 rec_committed;	/* 이 앞까지 장치에 기록됨 */
+	bool		 frozen;	/* 체크포인트 스냅샷 동안 새 할당 정지 */
+	bool		 commit_req;	/* 주기·링 압박 커밋 요청 */
+	u32		 epoch;		/* 쓰기 묶음 번호. 홀짝으로 inflight 를 나눈다 */
+	atomic_t	 ep_inflight[2];
+	wait_queue_head_t ep_wq;	/* 묶음의 쓰기가 다 끝나면 */
+	wait_queue_head_t ring_wq;	/* 링 자리가 나거나 frozen 이 풀리면 */
+	struct bio_list	 flush_list;	/* 빈 flush bio — 커밋 뒤 완료 */
+	struct bio_list	 fua_list;	/* 데이터가 끝난 FUA 쓰기 — 커밋 뒤 완료 */
+	struct bio_set	 fua_bs;
+	struct workqueue_struct *log_wq;
+	struct work_struct	 log_work;
+	struct delayed_work	 log_tick;
+	bool		 crashed;	/* message crash: 전원 차단 흉내 */
+
 	/* --- 통계 (dmsetup status) --- */
+	u64	stat_commits;
+	u64	stat_ckpts;
+	u64	stat_log_blocks;
+	u64	recover_ms;
 	u64	stat_flushes;
 	u64	stat_compactions;
 	u64	stat_dropped;	/* 인덱스에서 제거된 중복 엔트리 수 */
@@ -403,6 +531,7 @@ static bool mem_flush_locked(struct zns_base_c *c)
 
 	run->ents = c->spare;
 	run->n    = i;
+	run->cap  = NODE_POOL_MAX;
 
 	c->spare     = NULL;
 	c->spare_run = NULL;
@@ -651,6 +780,9 @@ static bool zns_compact_step(struct zns_base_c *c)
 
 	merged->ents = ents;
 	merged->n    = n;
+	merged->cap  = 0;
+	for (i = 0; i < k; i++)
+		merged->cap += snap[i]->n;	/* zns_merge_runs 의 할당 크기 */
 
 	spin_lock_irqsave(&c->map_lock, flags);
 	anchor = snap[k - 1]->list.next;
@@ -760,6 +892,552 @@ static sector_t zone_alloc_locked(struct zns_base_c *c, sector_t len_sectors,
 	pba = z->wp;
 	z->wp += len_sectors;
 	return pba;
+}
+
+/* ==================================================================
+ * 메타데이터 — 매핑 로그와 체크포인트
+ *
+ * 마지막 두 zone 이 메타 zone 이다. 한 번에 하나에만 이어 쓰고, 체크포인트를
+ * 새로 쓸 때 다른 하나를 reset 해 그쪽으로 옮겨 간다(세대 gen + 1). 한 zone
+ * 의 내용은 기록 순서대로
+ *
+ *     [SB] [CKPT ...] [CKPT_END] [LOG] [LOG] ...
+ *
+ * SB 는 세대와 지오메트리, CKPT 는 그 시점의 매핑 전체(lba 순), LOG 는 그
+ * 뒤의 매핑 변경(extent)이다. 블록마다 crc 를 둔다. 복구는 CKPT_END 까지
+ * 온전한 zone 중 세대가 큰 것을 골라 체크포인트를 읽고 로그를 차례로 재생
+ * 한다. zone 은 앞에서부터만 쓰이므로 블록 위치 순서가 곧 기록 순서다.
+ *
+ * ── 무엇을 언제 기록하나 ──
+ *   매핑 변경은 map_lock 아래에서 레코드 링에 쌓인다 — 순서가 매핑 갱신
+ *   순서와 같다. 사용자 쓰기의 레코드는 데이터가 장치에 닿은 뒤에만 기록할
+ *   수 있다(먼저 기록하면 크래시 뒤 쓰이지 않은 위치를 가리킨다). 그래서
+ *   쓰기마다 epoch 를 붙인다. 커밋은 epoch 를 넘긴 뒤 이전 epoch 의 쓰기가
+ *   다 끝나기를 기다리고, 그때까지의 레코드를 기록한다. 실패한 쓰기는 VOID
+ *   로 표시돼 빠진다. GC 이주의 레코드는 데이터를 쓴 뒤 붙으므로 바로 기록할
+ *   수 있다.
+ *
+ * ── 위쪽과의 계약 (크래시 일관성) ──
+ *   위쪽에는 휘발성 쓰기 캐시가 있는 장치로 광고한다(flush_supported).
+ *     - flush: 그 전에 완료된 쓰기의 레코드를 기록한 뒤 완료한다.
+ *     - FUA 쓰기: 자기 레코드가 기록된 뒤 완료한다.
+ *     - 그 밖의 완료된 쓰기: 크래시 뒤 옛 내용 또는 새 내용이다. 쓰이지 않은
+ *       위치를 가리키는 일은 없다.
+ *   ext4 저널이 가정하는 것은 이 계약(flush + FUA)뿐이다.
+ *
+ * ── GC 와의 순서 ──
+ *   victim 을 reset 하기 전에 커밋한다. 이주한 블록의 새 위치와 victim 의
+ *   블록을 죽인 덮어쓰기가 기록된 뒤라야, 크래시 뒤의 매핑이 reset 된 zone
+ *   을 가리키지 않는다. 덮어쓰기는 GC 스캔보다 먼저 할당됐으므로 커밋의
+ *   epoch 대기가 그 완료까지 기다려 준다.
+ * ================================================================== */
+
+static inline u64 zns_ring_used(struct zns_base_c *c)
+{
+	return c->rec_next - c->rec_committed;
+}
+
+/* map_lock 필요. 레코드 번호를 돌려준다. */
+static u64 zns_rec_append_locked(struct zns_base_c *c, sector_t lba_blk,
+				 sector_t pba, sector_t nr_blocks)
+{
+	struct zns_rec *r = &c->ring[c->rec_next & (c->ring_cap - 1)];
+
+	r->lba   = (u32)lba_blk;
+	r->pba   = (u32)(pba >> BLOCK_SHIFT);
+	r->len   = (u32)nr_blocks;
+	r->flags = 0;
+	return c->rec_next++;
+}
+
+/* 메타 zone i(0/1) 의 zone 번호 */
+static inline unsigned int zns_md_zone(struct zns_base_c *c, unsigned int i)
+{
+	return c->data_zones + i;
+}
+
+static inline void *zns_md_blk(struct zns_base_c *c, unsigned int i)
+{
+	return page_address(c->md_pages[i]);
+}
+
+static void zns_md_seal(void *blk, u32 type, u64 gen, u64 seq, u32 count,
+			u64 aux)
+{
+	struct zns_md_hdr *h = blk;
+
+	h->magic = cpu_to_le32(ZNS_MD_MAGIC);
+	h->type  = cpu_to_le32(type);
+	h->gen   = cpu_to_le64(gen);
+	h->seq   = cpu_to_le64(seq);
+	h->crc   = 0;
+	h->count = cpu_to_le32(count);
+	h->aux   = cpu_to_le64(aux);
+	h->crc   = cpu_to_le32(crc32_le(~0U, blk, ZNS_MD_BLK));
+}
+
+/* 블록이 온전하면 type, 아니면 0. gen 이 0 이 아니면 세대도 맞아야 한다. */
+static u32 zns_md_check(void *blk, u64 gen)
+{
+	struct zns_md_hdr *h = blk;
+	u32 crc = le32_to_cpu(h->crc);
+	bool ok;
+
+	if (le32_to_cpu(h->magic) != ZNS_MD_MAGIC)
+		return 0;
+	if (gen && le64_to_cpu(h->gen) != gen)
+		return 0;
+	h->crc = 0;
+	ok = crc32_le(~0U, blk, ZNS_MD_BLK) == crc;
+	h->crc = cpu_to_le32(crc);
+	return ok ? le32_to_cpu(h->type) : 0;
+}
+
+/* md_pages[0..n) 를 sect 에서 동기로 읽거나 쓴다. sleepable. */
+static int zns_md_io(struct zns_base_c *c, sector_t sect, unsigned int n,
+		     zns_req_op_t op)
+{
+	struct bio *b;
+	unsigned int i;
+	int ret;
+
+	b = zns_bio_alloc_bs(c->dev->bdev, n, op | REQ_SYNC, GFP_NOIO, &c->md_bs);
+	if (!b)
+		return -ENOMEM;
+	b->bi_iter.bi_sector = sect;
+	for (i = 0; i < n; i++) {
+		if (!bio_add_page(b, c->md_pages[i], ZNS_MD_BLK, 0)) {
+			bio_put(b);
+			return -EIO;
+		}
+	}
+	ret = submit_bio_wait(b);
+	bio_put(b);
+	return ret;
+}
+
+/* 지금 메타 zone 에 이어 쓴다. log_lock 필요. */
+static int zns_md_append(struct zns_base_c *c, unsigned int n)
+{
+	int ret = zns_md_io(c, c->md_wp, n, REQ_OP_WRITE);
+
+	if (!ret)
+		c->md_wp += (sector_t)n << BLOCK_SHIFT;
+	return ret;
+}
+
+/* 지금 메타 zone 에 남은 블록 수 */
+static sector_t zns_md_room(struct zns_base_c *c)
+{
+	struct zns_zone *z = &c->zones[zns_md_zone(c, c->md_cur)];
+
+	return (z->start + c->zone_sectors - c->md_wp) >> BLOCK_SHIFT;
+}
+
+/*
+ * 메타 zone mz 를 reset 하고 세대 gen 을 연다: SB + 체크포인트(ents) +
+ * CKPT_END. flush 까지 끝나야 이 세대가 복구 대상이 되므로, 도중에 실패
+ * 하거나 크래시가 나도 다른 메타 zone 의 이전 세대가 그대로 남는다.
+ * 성공하면 이 zone 으로 옮겨 간다. log_lock 필요 (format 은 ctr 에서 혼자).
+ */
+static int zns_md_write_gen(struct zns_base_c *c, unsigned int mz, u64 gen,
+			    const struct zns_ent *ents, unsigned int n)
+{
+	sector_t wp = c->zones[mz].start;
+	unsigned int nb = 0, done = 0, ckpt_blocks = 0;
+	struct zns_md_sb *sb;
+	u32 crc_all = ~0U;
+	u64 seq = 0;
+	void *blk;
+	int ret;
+
+	/* SB + 체크포인트 + 끝 — ctr 가 들어맞음을 확인했지만 넘쳐 쓰지 않게 다시 */
+	if (2 + DIV_ROUND_UP(n, ZNS_ENTS_PER_BLK) > (c->zone_sectors >> BLOCK_SHIFT))
+		return -ENOSPC;
+
+	ret = zns_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, wp, c->zone_sectors);
+	if (ret)
+		return ret;
+
+	blk = zns_md_blk(c, nb++);
+	memset(blk, 0, ZNS_MD_BLK);
+	sb = blk + sizeof(struct zns_md_hdr);
+	sb->version        = cpu_to_le32(ZNS_MD_VERSION);
+	sb->nr_zones       = cpu_to_le32(c->nr_zones);
+	sb->zone_sectors   = cpu_to_le64(c->zone_sectors);
+	sb->logical_blocks = cpu_to_le64(c->total_blocks);
+	zns_md_seal(blk, ZNS_MD_SB, gen, seq++, 0, 0);
+
+	while (done < n) {
+		unsigned int cnt = min_t(unsigned int, n - done, ZNS_ENTS_PER_BLK);
+		struct zns_md_ent *e;
+		unsigned int i;
+
+		blk = zns_md_blk(c, nb++);
+		memset(blk, 0, ZNS_MD_BLK);
+		e = blk + sizeof(struct zns_md_hdr);
+		for (i = 0; i < cnt; i++) {
+			e[i].lba = cpu_to_le32((u32)ents[done + i].lba_blk);
+			e[i].pba = cpu_to_le32((u32)(ents[done + i].pba >> BLOCK_SHIFT));
+		}
+		crc_all = crc32_le(crc_all, (void *)e, cnt * sizeof(*e));
+		zns_md_seal(blk, ZNS_MD_CKPT, gen, seq++, cnt, done);
+		done += cnt;
+		ckpt_blocks++;
+
+		if (nb == ZNS_MD_BATCH) {
+			ret = zns_md_io(c, wp, nb, REQ_OP_WRITE);
+			if (ret)
+				return ret;
+			wp += (sector_t)nb << BLOCK_SHIFT;
+			nb = 0;
+			cond_resched();
+		}
+	}
+
+	blk = zns_md_blk(c, nb++);
+	memset(blk, 0, ZNS_MD_BLK);
+	*(__le32 *)(blk + sizeof(struct zns_md_hdr)) = cpu_to_le32(crc_all);
+	zns_md_seal(blk, ZNS_MD_CKPT_END, gen, seq++, ckpt_blocks, n);
+	ret = zns_md_io(c, wp, nb, REQ_OP_WRITE);
+	if (ret)
+		return ret;
+	wp += (sector_t)nb << BLOCK_SHIFT;
+
+	ret = blkdev_issue_flush(c->dev->bdev);
+	if (ret)
+		return ret;
+
+	c->md_cur        = mz - zns_md_zone(c, 0);
+	c->md_gen        = gen;
+	c->md_seq        = seq;
+	c->md_wp         = wp;
+	c->md_log_blocks = 0;
+	return 0;
+}
+
+/* 레코드 [from, to) 를 LOG 블록으로 이어 쓴다. 자리가 모자라면 -ENOSPC. log_lock 필요. */
+static int zns_write_log(struct zns_base_c *c, u64 from, u64 to)
+{
+	struct zns_md_rec *rr = NULL;
+	unsigned int nb = 0, cnt = 0, need;
+	u64 s, nrec = 0, first = 0;
+	void *blk = NULL;
+	int ret;
+
+	for (s = from; s < to; s++)
+		if (!(c->ring[s & (c->ring_cap - 1)].flags & ZNS_REC_VOID))
+			nrec++;
+	if (!nrec)
+		return 0;
+	need = (unsigned int)DIV_ROUND_UP_ULL(nrec, ZNS_RECS_PER_BLK);
+	if (need > zns_md_room(c))
+		return -ENOSPC;
+
+	for (s = from; s < to; s++) {
+		const struct zns_rec *r = &c->ring[s & (c->ring_cap - 1)];
+
+		if (r->flags & ZNS_REC_VOID)
+			continue;
+		if (!blk) {
+			blk = zns_md_blk(c, nb);
+			memset(blk, 0, ZNS_MD_BLK);
+			rr = blk + sizeof(struct zns_md_hdr);
+			cnt = 0;
+			first = s;
+		}
+		rr[cnt].lba = cpu_to_le32(r->lba);
+		rr[cnt].pba = cpu_to_le32(r->pba);
+		rr[cnt].len = cpu_to_le32(r->len);
+		if (++cnt < ZNS_RECS_PER_BLK)
+			continue;
+
+		zns_md_seal(blk, ZNS_MD_LOG, c->md_gen, c->md_seq++, cnt, first);
+		blk = NULL;
+		if (++nb == ZNS_MD_BATCH) {
+			ret = zns_md_append(c, nb);
+			if (ret)
+				return ret;
+			nb = 0;
+		}
+	}
+	if (blk) {
+		zns_md_seal(blk, ZNS_MD_LOG, c->md_gen, c->md_seq++, cnt, first);
+		nb++;
+	}
+	if (nb) {
+		ret = zns_md_append(c, nb);
+		if (ret)
+			return ret;
+	}
+	c->md_log_blocks   += need;
+	c->stat_log_blocks += need;
+	return 0;
+}
+
+/*
+ * 체크포인트: 지금의 매핑 전체를 다른 메타 zone 에 새 세대로 쓰고 그쪽으로
+ * 옮긴다. 로그가 길어지거나 메타 zone 이 차면 커밋이 부른다. log_lock 필요.
+ *
+ * 체크포인트에는 완료된 쓰기만 반영돼야 한다. 새 할당을 잠시 막고(frozen)
+ * 진행 중인 쓰기를 모두 끝낸 뒤, 매핑 스냅샷과 레코드 경계를 같은 락 구간
+ * 에서 잡는다. 스냅샷 직후 쓰기를 풀어 준다 — 그 뒤의 변경은 경계 이후의
+ * 레코드라 새 zone 의 로그로 간다. *boundary 에 덮은 경계를 돌려준다.
+ */
+static int zns_checkpoint(struct zns_base_c *c, u64 *boundary)
+{
+	struct zns_run **snap = NULL;
+	struct zns_run *memrun, *r;
+	struct zns_ent *mem, *ents = NULL;
+	struct rb_node *node;
+	unsigned long flags;
+	unsigned int k = 0, kmax, n = 0, mn = 0;
+	u64 total = 0, dropped, b;
+	int ret = 0;
+
+	mem    = zns_kvmalloc_array(NODE_POOL_MAX, sizeof(*mem), GFP_NOIO);
+	memrun = kzalloc(sizeof(*memrun), GFP_NOIO);
+	if (!mem || !memrun) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	spin_lock_irqsave(&c->map_lock, flags);
+	c->frozen = true;
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	wait_event(c->ep_wq, !atomic_read(&c->ep_inflight[0]) &&
+			     !atomic_read(&c->ep_inflight[1]));
+	smp_rmb();
+
+	/* 기다리는 동안 쓰기가 실패했으면 그 매핑을 체크포인트에 넣으면 안 된다 */
+	ret = READ_ONCE(c->md_err) ? -EIO : 0;
+	/* 체크포인트가 가리킬 데이터를 하위의 휘발성 캐시에서 먼저 내린다 */
+	if (!ret)
+		ret = blkdev_issue_flush(c->dev->bdev);
+	if (ret) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		c->frozen = false;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		wake_up_all(&c->ring_wq);
+		goto out;
+	}
+
+	/* run 배열을 락 밖에서 읽으므로 컴팩션과 배제한다 (GC 스캔과 같은 방식) */
+	atomic_inc(&c->gc_waiting);
+	for (;;) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		if (!c->compacting)
+			break;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		wait_event(c->compact_done, !READ_ONCE(c->compacting));
+	}
+	atomic_dec(&c->gc_waiting);
+	c->compacting = true;
+
+	/* run 수는 GC 의 flush 로 늘 수 있다 — 넉넉히 잡고 모자라면 다시 */
+	for (;;) {
+		kmax = c->nr_runs + 1 + 8;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		kfree(snap);
+		snap = kcalloc(kmax, sizeof(*snap), GFP_NOIO);
+		spin_lock_irqsave(&c->map_lock, flags);
+		if (!snap || c->nr_runs + 1 <= kmax)
+			break;
+	}
+	if (!snap) {
+		c->compacting = false;
+		c->frozen = false;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		wake_up_all(&c->compact_done);
+		wake_up_all(&c->ring_wq);
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (node = rb_first(&c->memtable); node; node = rb_next(node))
+		mem[mn++] = rb_entry(node, struct zns_mnode, rb)->ent;
+	memrun->ents = mem;
+	memrun->n    = mn;
+	snap[k++] = memrun;			/* 가장 최신 */
+	list_for_each_entry(r, &c->runs, list)
+		snap[k++] = r;
+	b = c->rec_next;
+	c->frozen = false;
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	wake_up_all(&c->ring_wq);
+
+	for (n = 0; n < k; n++)
+		total += snap[n]->n;
+	n = 0;
+	if (total) {
+		ents = zns_merge_runs(snap, k, &n, &dropped);
+		if (!ents)
+			ret = -ENOMEM;
+	}
+
+	spin_lock_irqsave(&c->map_lock, flags);
+	c->compacting = false;
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	wake_up_all(&c->compact_done);
+
+	if (!ret)
+		ret = zns_md_write_gen(c, zns_md_zone(c, 1 - c->md_cur),
+				       c->md_gen + 1, ents, n);
+	if (!ret) {
+		*boundary = b;
+		c->stat_ckpts++;
+		DMINFO("checkpoint: gen %llu, %u mappings",
+		       (unsigned long long)c->md_gen, n);
+	}
+	kvfree(ents);
+out:
+	kfree(snap);
+	kfree(memrun);
+	kvfree(mem);
+	return ret;
+}
+
+/*
+ * 커밋: 지금까지 완료된 쓰기의 매핑 변경을 장치에 기록한다. flush/FUA,
+ * GC 의 reset 전 장벽, 주기 커밋이 모두 이것을 부른다. sleepable.
+ */
+static int zns_log_commit(struct zns_base_c *c, bool force_ckpt)
+{
+	unsigned long flags;
+	u64 boundary;
+	u32 old;
+	int ret;
+
+	mutex_lock(&c->log_lock);
+	if (READ_ONCE(c->crashed) || READ_ONCE(c->md_err)) {
+		ret = -EIO;
+		goto out;
+	}
+
+	spin_lock_irqsave(&c->map_lock, flags);
+	old = c->epoch++;
+	boundary = c->rec_next;
+	spin_unlock_irqrestore(&c->map_lock, flags);
+
+	/*
+	 * 경계 앞 레코드의 쓰기가 모두 끝나야 기록할 수 있다. 그보다 이전 묶음은
+	 * 앞선 커밋이 이미 기다렸으므로 이 묶음만 보면 된다(커밋은 직렬).
+	 */
+	wait_event(c->ep_wq, !atomic_read(&c->ep_inflight[old & 1]));
+	smp_rmb();	/* 쓰기 완료 쪽이 남긴 VOID 표시와 md_err 를 본다 */
+
+	/*
+	 * 기다리는 동안 데이터 쓰기가 실패했으면 커밋하지 않는다(fail-stop).
+	 * 실패한 쓰기의 메모리 매핑은 쓰이지 않은 위치를 가리키므로, 그 뒤의
+	 * 체크포인트나 GC reset 이 장치의 매핑을 그 상태로 끌고 가면 안 된다.
+	 */
+	if (READ_ONCE(c->md_err) || READ_ONCE(c->crashed)) {
+		ret = -EIO;
+		goto out;
+	}
+
+	/* 데이터가 하위의 휘발성 캐시에만 있을 수 있다 — 메타보다 먼저 내린다 */
+	ret = blkdev_issue_flush(c->dev->bdev);
+
+	if (!ret) {
+		ret = -ENOSPC;
+		if (!force_ckpt && c->md_log_blocks < ZNS_LOG_CKPT_BLOCKS)
+			ret = zns_write_log(c, c->rec_committed, boundary);
+	}
+	if (ret == -ENOSPC) {
+		ret = zns_checkpoint(c, &boundary);
+		/* 메모리가 모자라 체크포인트를 못 하면 자리가 남은 한 로그로 */
+		if (ret == -ENOMEM)
+			ret = zns_write_log(c, c->rec_committed, boundary);
+	}
+	if (!ret)
+		ret = blkdev_issue_flush(c->dev->bdev);
+	if (ret) {
+		if (ret != -EIO || !READ_ONCE(c->md_err))
+			DMERR("metadata commit failed (%d); writes and flushes will fail from now on",
+			      ret);
+		WRITE_ONCE(c->md_err, true);
+		wake_up_all(&c->ring_wq);
+		goto out;
+	}
+
+	spin_lock_irqsave(&c->map_lock, flags);
+	c->rec_committed = boundary;
+	c->stat_commits++;
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	wake_up_all(&c->ring_wq);
+out:
+	mutex_unlock(&c->log_lock);
+	return ret;
+}
+
+/*
+ * flush 와 FUA 쓰기를 완료시키는 워커. 모아 둔 것을 커밋 한 번으로 처리
+ * 한다(group commit). FUA 쓰기는 자기 레코드가 커밋된 것만 완료한다 — 커밋
+ * 도중에 끝난 FUA 쓰기는 다음 바퀴의 커밋을 기다린다.
+ */
+static void zns_log_workfn(struct work_struct *w)
+{
+	struct zns_base_c *c = container_of(w, struct zns_base_c, log_work);
+	struct bio_list flushes, done, keep;
+	unsigned long flags;
+	struct bio *bio;
+	bool need;
+	int ret;
+
+	for (;;) {
+		bio_list_init(&flushes);
+		bio_list_init(&done);
+		bio_list_init(&keep);
+
+		spin_lock_irqsave(&c->map_lock, flags);
+		bio_list_merge(&flushes, &c->flush_list);
+		bio_list_init(&c->flush_list);
+		need = !bio_list_empty(&flushes) || !bio_list_empty(&c->fua_list) ||
+		       (c->commit_req && c->rec_next != c->rec_committed);
+		c->commit_req = false;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		if (!need)
+			return;
+
+		ret = zns_log_commit(c, false);
+
+		while ((bio = bio_list_pop(&flushes))) {
+			bio->bi_status = ret ? BLK_STS_IOERR : BLK_STS_OK;
+			bio_endio(bio);
+		}
+
+		spin_lock_irqsave(&c->map_lock, flags);
+		while ((bio = bio_list_pop(&c->fua_list))) {
+			if (ret || zns_pio(bio)->rec_seq < c->rec_committed)
+				bio_list_add(&done, bio);
+			else
+				bio_list_add(&keep, bio);
+		}
+		c->fua_list = keep;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+
+		while ((bio = bio_list_pop(&done))) {
+			if (ret)
+				bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+		}
+		if (ret)
+			return;		/* 이후 커밋도 실패한다 — 남은 건 다음 요청이 끝낸다 */
+		cond_resched();
+	}
+}
+
+static void zns_log_tickfn(struct work_struct *w)
+{
+	struct zns_base_c *c = container_of(to_delayed_work(w),
+					    struct zns_base_c, log_tick);
+
+	if (READ_ONCE(c->rec_next) != READ_ONCE(c->rec_committed)) {
+		WRITE_ONCE(c->commit_req, true);
+		queue_work(c->log_wq, &c->log_work);
+	}
+	queue_delayed_work(system_wq, &c->log_tick, ZNS_LOG_TICK);
 }
 
 /* ==================================================================
@@ -1028,6 +1706,14 @@ restart:
 			goto out;
 		}
 
+		/* 레코드 자리 — 링이 꽉 찼으면 먼저 커밋해 비운다 */
+		while (READ_ONCE(c->rec_next) - READ_ONCE(c->rec_committed) >=
+		       c->ring_cap) {
+			ret = zns_log_commit(c, false);
+			if (ret)
+				goto out;
+		}
+
 		/*
 		 * CAS: 복사하는 동안 사용자가 같은 LBA 를 덮어썼다면 매핑이
 		 * 이미 다른 곳을 가리킨다 — 그 경우 복사본은 그냥 버린다
@@ -1035,7 +1721,8 @@ restart:
 		 * 나중에 GC 될 때 자연히 회수된다).
 		 */
 		spin_lock_irqsave(&c->map_lock, flags);
-		if (map_lookup(c, lba_blk) == pba) {
+		if (map_lookup(c, lba_blk) == pba &&
+		    zns_ring_used(c) < c->ring_cap) {
 			up = mem_upsert(c, lba_blk, new_pba, &old);
 			if (up < 0) {
 				/* 위에서 자리를 확보했지만 unlock 사이에
@@ -1049,6 +1736,8 @@ restart:
 			victim->valid--;
 			zone_of(c, new_pba)->valid++;
 			c->stat_migrated++;
+			/* 데이터는 이미 썼다 — 다음 커밋에 바로 기록돼도 된다 */
+			zns_rec_append_locked(c, lba_blk, new_pba, 1);
 		}
 		spin_unlock_irqrestore(&c->map_lock, flags);
 
@@ -1082,6 +1771,18 @@ do_reset:
 				ZNS_QUIESCE_TIMEOUT)) {
 		DMWARN("gc: zone %d still has I/O in flight, reset deferred", vidx);
 		ret = -ETIMEDOUT;
+		goto out;
+	}
+
+	/*
+	 * 장치에 기록된 매핑도 이 zone 을 가리키지 않게 한 뒤에 reset 한다.
+	 * 이주한 블록의 새 위치, 이 zone 의 블록을 죽인 덮어쓰기가 커밋돼야
+	 * 크래시 뒤의 매핑이 reset 된 zone 을 가리키지 않는다.
+	 */
+	ret = zns_log_commit(c, false);
+	if (ret) {
+		DMERR_LIMIT("gc: commit before reset failed (%d), zone %d kept",
+			    ret, vidx);
 		goto out;
 	}
 
@@ -1132,15 +1833,492 @@ static void zns_sub_workfn(struct work_struct *w);
  * Constructor / Destructor
  * ================================================================== */
 
-static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+/* ---- 포맷과 복구 ---- */
+
+struct zns_zinfo {
+	sector_t	wp;
+	u8		cond;
+};
+
+static int zns_report_cb(struct blk_zone *zone, unsigned int idx, void *data)
 {
-	struct zns_base_c *c;
-	sector_t max_len;
+	struct zns_zinfo *zi = data;
+
+	zi[idx].wp   = zone->wp;
+	zi[idx].cond = zone->cond;
+	return 0;
+}
+
+/* zone i 에서 장치에 실제로 쓰인 끝 */
+static sector_t zns_zi_end(struct zns_base_c *c, const struct zns_zinfo *zi,
+			   unsigned int i)
+{
+	if (zi[i].cond == BLK_ZONE_COND_FULL)
+		return c->zones[i].start + c->zone_sectors;
+	return zi[i].wp;
+}
+
+/* 인덱스를 비운다 */
+static void zns_index_reset(struct zns_base_c *c)
+{
+	struct zns_run *r, *tmp;
+
+	list_for_each_entry_safe(r, tmp, &c->runs, list) {
+		list_del(&r->list);
+		kvfree(r->ents);
+		kfree(r);
+	}
+	c->nr_runs   = 0;
+	c->memtable  = RB_ROOT;
+	c->mem_n     = 0;
+	c->node_used = 0;
+}
+
+/*
+ * run 들을 하나로 합친다. keep_oldest 면 가장 오래된 run(체크포인트)은 두고
+ * 그 위만 합친다. ctr 에서 혼자 돈다.
+ */
+static int zns_squash_runs(struct zns_base_c *c, bool keep_oldest)
+{
+	struct zns_run **snap, *merged, *r;
+	struct zns_ent *ents;
+	unsigned int k = 0, n = 0, total = 0, i;
+	u64 dropped;
+
+	if (c->nr_runs < (keep_oldest ? 3U : 2U))
+		return 0;
+	snap   = kcalloc(c->nr_runs, sizeof(*snap), GFP_KERNEL);
+	merged = kzalloc(sizeof(*merged), GFP_KERNEL);
+	if (!snap || !merged)
+		goto nomem;
+	list_for_each_entry(r, &c->runs, list) {
+		if (keep_oldest && list_is_last(&r->list, &c->runs))
+			break;
+		snap[k++] = r;
+		total += r->n;
+	}
+	ents = zns_merge_runs(snap, k, &n, &dropped);
+	if (!ents && total)
+		goto nomem;
+
+	for (i = 0; i < k; i++) {
+		list_del(&snap[i]->list);
+		kvfree(snap[i]->ents);
+		kfree(snap[i]);
+	}
+	merged->ents = ents;
+	merged->n    = n;
+	merged->cap  = total;
+	list_add(&merged->list, &c->runs);	/* 남은 체크포인트 run 보다 최신 */
+	c->nr_runs = c->nr_runs - k + 1;
+	kfree(snap);
+	return 0;
+nomem:
+	kfree(snap);
+	kfree(merged);
+	return -ENOMEM;
+}
+
+/* 로그 레코드의 블록 하나를 인덱스에 반영한다. ctr 에서 혼자 돈다. */
+static int zns_replay(struct zns_base_c *c, sector_t lba_blk, sector_t pba)
+{
+	unsigned long flags;
+	sector_t old;
+	bool flushed;
+	int up;
+
+	for (;;) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		if (c->node_used < NODE_POOL_MAX && c->mem_n < MEMTABLE_MAX) {
+			up = mem_upsert(c, lba_blk, pba, &old);
+			spin_unlock_irqrestore(&c->map_lock, flags);
+			return up < 0 ? -ENOMEM : 0;
+		}
+		flushed = mem_flush_locked(c);
+		spin_unlock_irqrestore(&c->map_lock, flags);
+
+		zns_refill_spares(c);
+		if (!c->spare || !c->spare_run)
+			return -ENOMEM;
+		/* 긴 로그는 run 을 많이 만든다 — 체크포인트 위쪽을 수시로 합친다 */
+		if (flushed && c->nr_runs >= 64 && zns_squash_runs(c, true))
+			return -ENOMEM;
+	}
+}
+
+struct zns_recov {
+	unsigned int	ckpt;		/* 체크포인트의 매핑 수 */
+	unsigned int	log_blocks;
+	u64		records;
+	unsigned int	torn;		/* crc 가 안 맞아 건너뛴 메타 블록 */
+	unsigned int	bad;		/* 범위를 벗어난 레코드 */
+};
+
+/*
+ * 메타 zone idx 의 세대 gen 을 읽어 인덱스를 만든다: 체크포인트를 가장
+ * 오래된 run 으로 놓고, 로그를 기록 순서대로 재생한다. 체크포인트가 온전
+ * 하지 않으면 -EAGAIN (다른 메타 zone 을 본다).
+ *
+ * crc 가 안 맞는 블록은 건너뛴다. 크래시로 끝나지 못한 커밋의 블록이다 —
+ * 그 커밋을 기다리던 flush/FUA 는 완료되지 않았으므로 버려도 계약이 지켜
+ * 진다. 그 뒤에 이어 쓴 블록은 위치 순서가 곧 기록 순서라 그대로 재생한다.
+ */
+static int zns_load_gen(struct zns_base_c *c, unsigned int idx, u64 gen,
+			const struct zns_zinfo *zi, struct zns_recov *st)
+{
+	unsigned int mz = zns_md_zone(c, idx);
+	sector_t s = c->zones[mz].start;
+	sector_t end = zns_zi_end(c, zi, mz);
+	sector_t data_end = (sector_t)c->data_zones * c->zone_sectors;
+	sector_t ck_cap = max_t(sector_t, c->total_blocks, 1);
+	unsigned int ckpt_blocks = 0, ckpt_n = 0, i, j;
+	struct zns_ent *ck;
+	u32 crc_all = ~0U;
+	u64 last_seq = 0;
+	bool ckpt_done = false;
+	int ret = 0;
+
+	zns_index_reset(c);
+	memset(st, 0, sizeof(*st));
+	ck = zns_kvmalloc_array(ck_cap, sizeof(*ck), GFP_KERNEL);
+	if (!ck)
+		return -ENOMEM;
+
+	/* 4 KiB 블록 중간에서 끊긴 꼬리는 읽지 않는다 */
+	while (s < (end & ~(sector_t)(SECTORS_PER_BLOCK - 1))) {
+		unsigned int nb = (unsigned int)min_t(sector_t,
+						      (end - s) >> BLOCK_SHIFT,
+						      ZNS_MD_BATCH);	/* ≥ 1 */
+
+		ret = zns_md_io(c, s, nb, REQ_OP_READ);
+		if (ret)
+			goto out;
+
+		for (i = 0; i < nb; i++) {
+			void *blk = zns_md_blk(c, i);
+			struct zns_md_hdr *h = blk;
+			u32 type = zns_md_check(blk, gen);
+			u32 cnt = le32_to_cpu(h->count);
+
+			if (!type) {
+				st->torn++;
+				continue;
+			}
+			last_seq = le64_to_cpu(h->seq);
+
+			if (type == ZNS_MD_CKPT) {
+				struct zns_md_ent *e = blk + sizeof(*h);
+
+				if (ckpt_done || cnt > ZNS_ENTS_PER_BLK ||
+				    le64_to_cpu(h->aux) != ckpt_n ||
+				    ckpt_n + cnt > ck_cap) {
+					ret = -EAGAIN;
+					goto out;
+				}
+				for (j = 0; j < cnt; j++) {
+					ck[ckpt_n + j].lba_blk = le32_to_cpu(e[j].lba);
+					ck[ckpt_n + j].pba =
+						(sector_t)le32_to_cpu(e[j].pba) << BLOCK_SHIFT;
+				}
+				crc_all = crc32_le(crc_all, (void *)e, cnt * sizeof(*e));
+				ckpt_n += cnt;
+				ckpt_blocks++;
+			} else if (type == ZNS_MD_CKPT_END) {
+				struct zns_run *run;
+
+				if (ckpt_done || cnt != ckpt_blocks ||
+				    le64_to_cpu(h->aux) != ckpt_n ||
+				    le32_to_cpu(*(__le32 *)(blk + sizeof(*h))) != crc_all) {
+					ret = -EAGAIN;
+					goto out;
+				}
+				ckpt_done = true;
+				st->ckpt = ckpt_n;
+				if (!ckpt_n)
+					continue;
+				run = kzalloc(sizeof(*run), GFP_KERNEL);
+				if (!run) {
+					ret = -ENOMEM;
+					goto out;
+				}
+				run->ents = ck;
+				run->n    = ckpt_n;
+				run->cap  = (unsigned int)ck_cap;
+				list_add_tail(&run->list, &c->runs);	/* 가장 오래됨 */
+				c->nr_runs++;
+				ck = NULL;
+			} else if (type == ZNS_MD_LOG) {
+				struct zns_md_rec *rr = blk + sizeof(*h);
+
+				if (!ckpt_done || cnt > ZNS_RECS_PER_BLK) {
+					ret = -EAGAIN;
+					goto out;
+				}
+				for (j = 0; j < cnt; j++) {
+					u64 lba = le32_to_cpu(rr[j].lba);
+					u64 pba = le32_to_cpu(rr[j].pba);
+					u64 len = le32_to_cpu(rr[j].len);
+					u64 b;
+
+					if (!len || lba + len > c->total_blocks ||
+					    ((pba + len) << BLOCK_SHIFT) > data_end) {
+						st->bad++;
+						continue;
+					}
+					for (b = 0; b < len; b++) {
+						ret = zns_replay(c, lba + b,
+								 (pba + b) << BLOCK_SHIFT);
+						if (ret)
+							goto out;
+					}
+					st->records++;
+				}
+				st->log_blocks++;
+			}
+			/* SB 는 고를 때 확인했다 */
+		}
+		s += (sector_t)nb << BLOCK_SHIFT;
+		cond_resched();
+	}
+	if (!ckpt_done) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	/*
+	 * 이어 쓰기는 하위 wp 에서 — 끝나지 못한 블록 뒤로. wp 가 4 KiB 블록
+	 * 중간이면(512 B 장치의 전원 차단) 이후 블록이 전부 어긋나 다음 복구에서
+	 * 버려지므로, 이 zone 은 다 쓴 것으로 쳐서 첫 커밋이 체크포인트로 옮겨
+	 * 가게 한다.
+	 */
+	c->md_cur        = idx;
+	c->md_gen        = gen;
+	c->md_seq        = last_seq + 1;
+	c->md_wp         = (end & (SECTORS_PER_BLOCK - 1))
+			   ? c->zones[mz].start + c->zone_sectors : end;
+	c->md_log_blocks = st->log_blocks;
+out:
+	kvfree(ck);
+	return ret;
+}
+
+/*
+ * 메타 zone 에서 인덱스를 되살리고, valid 와 zone 상태를 하위 장치의 wp 로
+ * 다시 만든다. 반환: 0 복구, 1 메타데이터 없음, 음수 실패.
+ */
+static int zns_recover(struct zns_base_c *c, const struct zns_zinfo *zi)
+{
+	ktime_t t0 = ktime_get();
+	u64 gen[ZNS_META_ZONES] = { 0 };
+	unsigned int order[ZNS_META_ZONES] = { 0, 1 };
+	unsigned int i, mapped = 0, bad_map = 0;
+	struct zns_recov st = { 0 };
+	unsigned long flags;
+	struct zns_run *r;
+	bool flushed = true;
+	int ret;
+
+	for (i = 0; i < ZNS_META_ZONES; i++) {
+		unsigned int mz = zns_md_zone(c, i);
+		struct zns_md_sb *sb;
+		void *blk;
+
+		if (zns_zi_end(c, zi, mz) == c->zones[mz].start)
+			continue;
+		ret = zns_md_io(c, c->zones[mz].start, 1, REQ_OP_READ);
+		if (ret)
+			return ret;
+		blk = zns_md_blk(c, 0);
+		if (zns_md_check(blk, 0) != ZNS_MD_SB)
+			continue;
+		sb = blk + sizeof(struct zns_md_hdr);
+		if (le32_to_cpu(sb->version) != ZNS_MD_VERSION ||
+		    le32_to_cpu(sb->nr_zones) != c->nr_zones ||
+		    le64_to_cpu(sb->zone_sectors) != c->zone_sectors) {
+			DMERR("recover: metadata in zone %u is for another geometry", mz);
+			return -EINVAL;
+		}
+		if (le64_to_cpu(sb->logical_blocks) != c->total_blocks) {
+			DMERR("recover: formatted for %llu sectors, table has %llu",
+			      (unsigned long long)le64_to_cpu(sb->logical_blocks) << BLOCK_SHIFT,
+			      (unsigned long long)c->total_blocks << BLOCK_SHIFT);
+			return -EINVAL;
+		}
+		gen[i] = le64_to_cpu(((struct zns_md_hdr *)blk)->gen);
+	}
+	if (!gen[0] && !gen[1])
+		return 1;
+
+	if (gen[1] > gen[0]) {
+		order[0] = 1;
+		order[1] = 0;
+	}
+	ret = -EAGAIN;
+	for (i = 0; i < ZNS_META_ZONES && ret == -EAGAIN; i++) {
+		if (!gen[order[i]])
+			continue;
+		ret = zns_load_gen(c, order[i], gen[order[i]], zi, &st);
+		if (ret == -EAGAIN)
+			DMWARN("recover: generation %llu in zone %u is incomplete",
+			       (unsigned long long)gen[order[i]],
+			       zns_md_zone(c, order[i]));
+	}
+	if (ret) {
+		zns_index_reset(c);
+		if (ret == -EAGAIN) {
+			DMERR("recover: no complete checkpoint");
+			ret = -EINVAL;
+		}
+		return ret;
+	}
+
+	/* 인덱스를 run 하나로 */
+	spin_lock_irqsave(&c->map_lock, flags);
+	if (c->mem_n)
+		flushed = mem_flush_locked(c);
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	zns_refill_spares(c);
+	if (!flushed || zns_squash_runs(c, false))
+		return -ENOMEM;
+
+	/*
+	 * valid 는 매핑에서, zone 상태는 하위 wp 에서. 쓰이지 않은 위치를 가리키는
+	 * 매핑은 크래시 일관성이 깨진 흔적이다 — 세어서 알리고 인덱스에서 뺀다
+	 * (남겨 두면 그 위치에 새로 쓰인 다른 LBA 와 겹친다). 그 LBA 는 읽으면 0.
+	 */
+	r = list_first_entry_or_null(&c->runs, struct zns_run, list);
+	if (r) {
+		unsigned int keep = 0;
+
+		for (i = 0; i < r->n; i++) {
+			sector_t pba = r->ents[i].pba;
+			unsigned int z = zidx_of(c, pba);
+
+			if (z >= c->data_zones ||
+			    pba + SECTORS_PER_BLOCK > zns_zi_end(c, zi, z)) {
+				bad_map++;
+				continue;
+			}
+			c->zones[z].valid++;
+			r->ents[keep++] = r->ents[i];
+		}
+		r->n = keep;
+		mapped = keep;
+	}
+
+	c->free_zones = 0;
+	c->active_user_idx = -1;
+	c->active_gc_idx   = -1;
+	for (i = 0; i < c->data_zones; i++) {
+		struct zns_zone *z = &c->zones[i];
+		sector_t end = zns_zi_end(c, zi, i);
+
+		z->wp     = end;
+		z->sub_wp = end;
+		if (end == z->start) {
+			z->state = ZNS_ZONE_FREE;
+			c->free_zones++;
+		} else if (end >= z->start + c->zone_sectors ||
+			   (end & (SECTORS_PER_BLOCK - 1))) {
+			/* 꽉 찼거나, 4 KiB 블록 중간에서 끊겼다(512 B 장치의 전원 차단)
+			 * — 블록 단위 할당을 이어 갈 수 없으니 마감한다 */
+			z->state = ZNS_ZONE_FULL;
+		} else if (c->active_user_idx < 0) {
+			z->state = ZNS_ZONE_ACTIVE;	/* 하위 wp 에서 이어 쓴다 */
+			c->active_user_idx = i;
+		} else if (c->active_gc_idx < 0) {
+			z->state = ZNS_ZONE_ACTIVE;
+			c->active_gc_idx = i;
+		} else {
+			z->state = ZNS_ZONE_FULL;	/* 자투리는 GC 때 회수 */
+		}
+	}
+
+	c->stat_flushes = 0;
+	c->stat_dropped = 0;
+	c->recover_ms = (u64)ktime_ms_delta(ktime_get(), t0);
+	DMINFO("recover: gen %llu in zone %u, checkpoint %u + log %u blocks (%llu records), %u mappings, %llu ms",
+	       (unsigned long long)c->md_gen, zns_md_zone(c, c->md_cur),
+	       st.ckpt, st.log_blocks, (unsigned long long)st.records,
+	       mapped, (unsigned long long)c->recover_ms);
+	if (st.torn || st.bad || bad_map)
+		DMWARN("recover: %u torn metadata blocks skipped, %u bad records, %u mappings to unwritten space",
+		       st.torn, st.bad, bad_map);
+	return 0;
+}
+
+/* 장치 전체를 지우고 세대 1 을 연다 */
+static int zns_format(struct zns_base_c *c)
+{
 	unsigned int i;
 	int ret;
 
-	if (argc != 1) {
-		ti->error = "expected one argument: underlying device";
+	ret = zns_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, 0,
+			    c->total_sectors);
+	if (ret)
+		return ret;
+	for (i = 0; i < c->data_zones; i++) {
+		c->zones[i].state  = ZNS_ZONE_FREE;
+		c->zones[i].wp     = c->zones[i].start;
+		c->zones[i].sub_wp = c->zones[i].start;
+		c->zones[i].valid  = 0;
+	}
+	c->free_zones = c->data_zones;
+	return zns_md_write_gen(c, zns_md_zone(c, 0), 1, NULL, 0);
+}
+
+static void zns_free(struct dm_target *ti, struct zns_base_c *c)
+{
+	unsigned int i;
+
+	zns_index_reset(c);
+	bioset_exit(&c->gc_bs);
+	bioset_exit(&c->md_bs);
+	bioset_exit(&c->fua_bs);
+	for (i = 0; i < ZNS_MD_BATCH; i++)
+		if (c->md_pages[i])
+			__free_page(c->md_pages[i]);
+	kvfree(c->ring);
+	kvfree(c->zones);
+	kvfree(c->node_pool);
+	kvfree(c->spare);
+	kfree(c->spare_run);
+	if (c->dev)
+		dm_put_device(ti, c->dev);
+	kfree(c);
+}
+
+static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+{
+	struct zns_base_c *c;
+	struct zns_zinfo *zi = NULL;
+	unsigned int max_util = ZNS_DEFAULT_MAX_UTIL;
+	bool format = false, recovered = false;
+	u64 max_blocks;
+	sector_t max_len;
+	unsigned int i;
+	char dummy;
+	int ret;
+
+	if (argc < 1) {
+		ti->error = "usage: <dev> [format] [max_util:<permille>]";
+		return -EINVAL;
+	}
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "format"))
+			continue;
+		if (sscanf(argv[i], "max_util:%u%c", &max_util, &dummy) != 1 ||
+		    max_util < 1 || max_util > 999) {
+			ti->error = "bad argument (format | max_util:<1..999>)";
+			return -EINVAL;
+		}
+	}
+	for (i = 1; i < argc; i++)
+		if (!strcmp(argv[i], "format"))
+			format = true;
+
+	if (ti->len & (SECTORS_PER_BLOCK - 1)) {
+		ti->error = "length must be a multiple of 4 KiB";
 		return -EINVAL;
 	}
 
@@ -1152,113 +2330,189 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	spin_lock_init(&c->map_lock);
 	mutex_init(&c->gc_lock);
+	mutex_init(&c->log_lock);
 	INIT_WORK(&c->gc_work, zns_gc_workfn);
 	INIT_WORK(&c->sub_work, zns_sub_workfn);
 	INIT_WORK(&c->compact_work, zns_compact_workfn);
+	INIT_WORK(&c->log_work, zns_log_workfn);
+	INIT_DELAYED_WORK(&c->log_tick, zns_log_tickfn);
 	init_waitqueue_head(&c->compact_done);
-	bio_list_init(&c->sub_list);
-	atomic64_set(&c->queued_bytes, 0);
 	init_waitqueue_head(&c->admit_wq);
 	init_waitqueue_head(&c->idle_wq);
+	init_waitqueue_head(&c->ep_wq);
+	init_waitqueue_head(&c->ring_wq);
+	bio_list_init(&c->sub_list);
+	bio_list_init(&c->flush_list);
+	bio_list_init(&c->fua_list);
+	atomic64_set(&c->queued_bytes, 0);
+	atomic_set(&c->ep_inflight[0], 0);
+	atomic_set(&c->ep_inflight[1], 0);
 	c->memtable = RB_ROOT;
 	INIT_LIST_HEAD(&c->runs);
 	c->active_user_idx = -1;
 	c->active_gc_idx   = -1;
 
-	if (ti->len & (SECTORS_PER_BLOCK - 1)) {
-		ti->error = "length must be a multiple of 4 KiB";
-		ret = -EINVAL;
-		goto err_c;
-	}
-
-	/* 쓰기 진행이 GC 와 제출 워커에 달려 있으므로 메모리 압박에서도 굴러야 한다 */
-	c->gc_wq  = alloc_workqueue("zns-gc", WQ_MEM_RECLAIM, 1);
-	c->sub_wq = alloc_ordered_workqueue("zns-sub", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+	/* 쓰기 진행이 이 워커들에 달려 있으므로 메모리 압박에서도 굴러야 한다 */
+	c->gc_wq      = alloc_workqueue("zns-gc", WQ_MEM_RECLAIM, 1);
+	c->sub_wq     = alloc_ordered_workqueue("zns-sub", WQ_MEM_RECLAIM | WQ_HIGHPRI);
 	c->compact_wq = alloc_ordered_workqueue("zns-compact", WQ_MEM_RECLAIM);
-	if (!c->gc_wq || !c->sub_wq || !c->compact_wq) {
+	c->log_wq     = alloc_ordered_workqueue("zns-log", WQ_MEM_RECLAIM | WQ_HIGHPRI);
+	if (!c->gc_wq || !c->sub_wq || !c->compact_wq || !c->log_wq) {
 		ti->error = "cannot create workqueues";
 		ret = -ENOMEM;
-		goto err_wq;
+		goto err;
 	}
 
 	ret = bioset_init(&c->gc_bs, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+	if (!ret)
+		ret = bioset_init(&c->md_bs, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+	if (!ret)
+		ret = bioset_init(&c->fua_bs, BIO_POOL_SIZE, 0, 0);
 	if (ret) {
-		ti->error = "cannot create gc bioset";
-		goto err_wq;
+		ti->error = "cannot create biosets";
+		goto err;
 	}
 
-	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
-			    &c->dev);
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &c->dev);
 	if (ret) {
+		c->dev = NULL;
 		ti->error = "failed to open underlying device";
-		goto err_bs;
+		goto err;
 	}
 
 	c->zone_sectors = bdev_zone_sectors(c->dev->bdev);
 	if (!c->zone_sectors || (c->zone_sectors & (SECTORS_PER_BLOCK - 1))) {
 		ti->error = "underlying device is not zoned";
 		ret = -EINVAL;
-		goto err_dev;
+		goto err;
 	}
 
 	if (bdev_logical_block_size(c->dev->bdev) > (SECTORS_PER_BLOCK << SECTOR_SHIFT)) {
 		ti->error = "underlying logical block size is larger than 4 KiB";
 		ret = -EINVAL;
-		goto err_dev;
+		goto err;
 	}
 
 	if (!zns_zone_order_backend_ok(c->dev->bdev)) {
 		ti->error = "set the zoned device's I/O scheduler to mq-deadline";
 		ret = -EINVAL;
-		goto err_dev;
+		goto err;
 	}
 
-	/* zone 정수배만 쓴다. ti->len 의 자투리는 무시. */
-	c->nr_zones      = (unsigned int)(ti->len / c->zone_sectors);
-	c->total_sectors = (sector_t)c->nr_zones * c->zone_sectors;
-	c->total_blocks  = c->total_sectors >> BLOCK_SHIFT;
-	if (!c->nr_zones) {
-		ti->error = "device smaller than one zone";
+	/* 하위 zone 전부를 쓴다 — 앞은 데이터, 뒤 ZNS_META_ZONES 개는 메타 */
+	c->nr_zones = (unsigned int)(bdev_nr_sectors(c->dev->bdev) / c->zone_sectors);
+	if (c->nr_zones < ZNS_META_ZONES + 4) {
+		ti->error = "underlying device needs at least 6 zones";
 		ret = -EINVAL;
-		goto err_dev;
+		goto err;
+	}
+	c->data_zones    = c->nr_zones - ZNS_META_ZONES;
+	c->total_sectors = (sector_t)c->nr_zones * c->zone_sectors;
+	if ((c->total_sectors >> BLOCK_SHIFT) > U32_MAX) {
+		ti->error = "underlying device is larger than 16 TiB";
+		ret = -EINVAL;
+		goto err;
 	}
 
-	c->zones = kvcalloc(c->nr_zones, sizeof(*c->zones), GFP_KERNEL);
-	c->node_pool = kvmalloc_array(NODE_POOL_MAX, sizeof(*c->node_pool),
-				      GFP_KERNEL);
-	c->spare     = kvmalloc_array(NODE_POOL_MAX, sizeof(*c->spare),
-				      GFP_KERNEL);
+	/* 노출 용량 상한 — 머리 주석의 '노출 용량' */
+	c->total_blocks = ti->len >> BLOCK_SHIFT;
+	max_blocks = (u64)(c->data_zones - 2) * (c->zone_sectors >> BLOCK_SHIFT) *
+		     max_util / 1000;
+	if (!c->total_blocks || c->total_blocks > max_blocks) {
+		DMERR("ctr: %llu sectors requested, at most %llu with max_util:%u",
+		      (unsigned long long)ti->len,
+		      (unsigned long long)max_blocks << BLOCK_SHIFT, max_util);
+		ti->error = "logical size exceeds the over-provisioning limit";
+		ret = -EINVAL;
+		goto err;
+	}
+
+	/*
+	 * 메타 zone 하나에 최대 체크포인트(노출 블록 전부)와 링 하나 분량의 로그가
+	 * 들어가야 한다. 안 들어가면 체크포인트가 zone 을 넘치거나, 로그 자리가
+	 * 모자라 커밋마다 체크포인트를 쓰게 된다.
+	 */
+	if (2 + DIV_ROUND_UP_ULL(c->total_blocks, ZNS_ENTS_PER_BLK) +
+	    DIV_ROUND_UP_ULL(1ULL << ZNS_RING_ORDER, ZNS_RECS_PER_BLK) >
+	    (c->zone_sectors >> BLOCK_SHIFT)) {
+		ti->error = "a checkpoint of this size does not fit in one metadata zone";
+		ret = -EINVAL;
+		goto err;
+	}
+
+	c->ring_cap  = 1ULL << ZNS_RING_ORDER;
+	c->zones     = kvcalloc(c->nr_zones, sizeof(*c->zones), GFP_KERNEL);
+	c->node_pool = kvmalloc_array(NODE_POOL_MAX, sizeof(*c->node_pool), GFP_KERNEL);
+	c->spare     = kvmalloc_array(NODE_POOL_MAX, sizeof(*c->spare), GFP_KERNEL);
 	c->spare_run = kzalloc(sizeof(*c->spare_run), GFP_KERNEL);
-	if (!c->zones || !c->node_pool || !c->spare || !c->spare_run) {
+	c->ring      = kvmalloc_array(c->ring_cap, sizeof(*c->ring), GFP_KERNEL);
+	zi           = kvcalloc(c->nr_zones, sizeof(*zi), GFP_KERNEL);
+	if (!c->zones || !c->node_pool || !c->spare || !c->spare_run ||
+	    !c->ring || !zi) {
 		ti->error = "cannot allocate index/zone state";
 		ret = -ENOMEM;
-		goto err_free;
+		goto err;
+	}
+	for (i = 0; i < ZNS_MD_BATCH; i++) {
+		c->md_pages[i] = alloc_page(GFP_KERNEL);
+		if (!c->md_pages[i]) {
+			ti->error = "cannot allocate metadata buffer";
+			ret = -ENOMEM;
+			goto err;
+		}
 	}
 
 	for (i = 0; i < c->nr_zones; i++) {
 		c->zones[i].start  = (sector_t)i * c->zone_sectors;
 		c->zones[i].wp     = c->zones[i].start;
 		c->zones[i].sub_wp = c->zones[i].start;
-		c->zones[i].state  = ZNS_ZONE_FREE;
+		c->zones[i].state  = (i < c->data_zones) ? ZNS_ZONE_FREE
+							 : ZNS_ZONE_META;
 		atomic_set(&c->zones[i].wr_inflight, 0);
 		atomic_set(&c->zones[i].rd_inflight, 0);
 	}
-	c->free_zones = c->nr_zones;
+	c->free_zones = c->data_zones;
 
-	/*
-	 * 하위 zone 을 전부 reset 해 wp 를 0 으로 맞춘다. 인덱스가 in-memory
-	 * 라 dtr 에서 사라지므로, 하위에 남아 있던 데이터는 어차피 도달
-	 * 불가 — 지워도 잃을 것이 없다. (영속화 도입 시 되돌릴 결정.)
-	 */
-	ret = zns_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, 0,
-			    bdev_nr_sectors(c->dev->bdev));
-	if (ret) {
-		ti->error = "failed to reset zones on underlying device";
-		goto err_free;
+	ret = blkdev_report_zones(c->dev->bdev, 0, c->nr_zones, zns_report_cb, zi);
+	if (ret != (int)c->nr_zones) {
+		ti->error = "cannot report zones";
+		ret = ret < 0 ? ret : -EIO;
+		goto err;
 	}
+
+	if (!format) {
+		ret = zns_recover(c, zi);
+		if (ret == 1) {
+			/* 빈 장치는 그냥 연다. 무언가 있는데 메타데이터가 없으면 지우지 않는다. */
+			for (i = 0; i < c->nr_zones; i++) {
+				if (zns_zi_end(c, zi, i) != c->zones[i].start) {
+					ti->error = "no dm-zns metadata (add 'format' to initialize; erases the device)";
+					ret = -EINVAL;
+					goto err;
+				}
+			}
+			format = true;
+		} else if (ret) {
+			ti->error = "metadata recovery failed";
+			goto err;
+		} else {
+			recovered = true;
+		}
+	}
+	if (format) {
+		ret = zns_format(c);
+		if (ret) {
+			ti->error = "format failed";
+			goto err;
+		}
+	}
+	kvfree(zi);
+	zi = NULL;
 
 	ti->private          = c;
 	ti->num_flush_bios   = 1;
+	/* 하위가 write-through 여도 flush/FUA 를 받아 매핑 커밋의 시점으로 쓴다 */
+	ti->flush_supported  = true;
 	ti->per_io_data_size = sizeof(struct zns_pio);
 	zns_set_accounts_remapped(ti);
 
@@ -1274,64 +2528,55 @@ static int zns_base_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ret = dm_set_target_max_io_len(ti, max_len);
 	if (ret) {
 		ti->error = "cannot set max io len";
-		goto err_free;
+		goto err;
 	}
 
-	DMINFO("ctr: '%s', %u zones x %llu sectors, LSM index, GC reserve %u",
-	       argv[0], c->nr_zones,
-	       (unsigned long long)c->zone_sectors, GC_RESERVED_ZONES);
+	queue_delayed_work(system_wq, &c->log_tick, ZNS_LOG_TICK);
+
+	DMINFO("ctr: '%s', %u data + %u metadata zones x %llu sectors, %llu sectors exposed (max_util %u), %s",
+	       argv[0], c->data_zones, ZNS_META_ZONES,
+	       (unsigned long long)c->zone_sectors, (unsigned long long)ti->len,
+	       max_util, recovered ? "recovered" : "formatted");
 	return 0;
 
-err_free:
-	kvfree(c->zones);
-	kvfree(c->node_pool);
-	kvfree(c->spare);
-	kfree(c->spare_run);
-err_dev:
-	dm_put_device(ti, c->dev);
-err_bs:
-	bioset_exit(&c->gc_bs);
-err_wq:
+err:
+	kvfree(zi);
+	if (c->log_wq)
+		destroy_workqueue(c->log_wq);
 	if (c->compact_wq)
 		destroy_workqueue(c->compact_wq);
 	if (c->sub_wq)
 		destroy_workqueue(c->sub_wq);
 	if (c->gc_wq)
 		destroy_workqueue(c->gc_wq);
-err_c:
-	kfree(c);
+	zns_free(ti, c);
 	return ret;
 }
 
 static void zns_base_dtr(struct dm_target *ti)
 {
 	struct zns_base_c *c = ti->private;
-	struct zns_run *r, *tmp;
+
+	cancel_delayed_work_sync(&c->log_tick);
 
 	/* dtr 시점엔 진행 중 I/O 가 없다(DM 보장). 남은 작업만 끝내고 내린다. */
 	destroy_workqueue(c->sub_wq);
 	destroy_workqueue(c->gc_wq);
 	destroy_workqueue(c->compact_wq);	/* GC 뒤 — GC 가 컴팩션을 기다릴 수 있다 */
-	bioset_exit(&c->gc_bs);
 
-	list_for_each_entry_safe(r, tmp, &c->runs, list) {
-		list_del(&r->list);
-		kvfree(r->ents);
-		kfree(r);
-	}
+	/* 마지막 커밋 — 다음 생성 때 여기까지 복구된다. crash 흉내 뒤에는 쓰지 않는다. */
+	zns_log_commit(c, false);
+	destroy_workqueue(c->log_wq);
 
-	kvfree(c->zones);
-	kvfree(c->node_pool);
-	kvfree(c->spare);
-	kfree(c->spare_run);
-	dm_put_device(ti, c->dev);
-	kfree(c);
+	zns_free(ti, c);
 	DMINFO("dtr: target detached");
 }
 
 /* ==================================================================
  * Write I/O
  * ================================================================== */
+
+static void zns_fua_child_endio(struct bio *child);
 
 /*
  * 사용자 쓰기의 유일한 제출자.
@@ -1342,7 +2587,7 @@ static void zns_base_dtr(struct dm_target *ti)
  * (5.15: mq-deadline 삽입, 6.10+: zone write plug)까지 즉시 진행되므로,
  * 장치에 도착하는 순서도 할당 순서와 같다. .map 에서 바로 제출하면 제출이
  * .map 이 끝날 때까지 미뤄져, 발행자가 여럿일 때 나중에 할당받은 쓰기가
- * 먼저 도착한다.
+ * 먼저 도착한다. FUA 쓰기는 DM bio 대신 그 복제본이 목록에 있다.
  */
 static void zns_sub_workfn(struct work_struct *w)
 {
@@ -1363,7 +2608,9 @@ static void zns_sub_workfn(struct work_struct *w)
 
 		blk_start_plug(&plug);
 		while ((bio = bio_list_pop(&list))) {
-			struct zns_zone *z = &c->zones[zns_pio(bio)->zidx];
+			bool clone = bio->bi_end_io == zns_fua_child_endio;
+			struct bio *dm_bio = clone ? bio->bi_private : bio;
+			struct zns_zone *z = &c->zones[zns_pio(dm_bio)->zidx];
 
 			/* 제출 후에는 bio 를 건드리지 않는다 — 완료가 먼저 올 수 있다 */
 			if (unlikely(bio->bi_iter.bi_sector != z->sub_wp)) {
@@ -1373,7 +2620,10 @@ static void zns_sub_workfn(struct work_struct *w)
 					    (unsigned long long)z->sub_wp);
 			}
 			z->sub_wp = bio_end_sector(bio);
-			zns_submit_remapped(bio);
+			if (clone)
+				zns_submit_clone(dm_bio, bio);
+			else
+				zns_submit_remapped(bio);
 		}
 		blk_finish_plug(&plug);
 		cond_resched();
@@ -1390,6 +2640,14 @@ static void zns_admit(struct zns_base_c *c, struct bio *bio)
 	wait_event(c->admit_wq, (u64)atomic64_read(&c->queued_bytes) < limit);
 }
 
+/* 새 할당을 해도 되는가: 체크포인트 스냅샷 중이 아니고 레코드 링에 자리가 있다 */
+static bool zns_may_alloc(struct zns_base_c *c)
+{
+	return !READ_ONCE(c->frozen) &&
+	       READ_ONCE(c->rec_next) - READ_ONCE(c->rec_committed) +
+	       ZNS_RING_GC_HEADROOM < c->ring_cap;
+}
+
 static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
@@ -1401,7 +2659,9 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 	sector_t pba;
 	sector_t i;
 	unsigned long flags;
-	bool need_refill, low_free;
+	bool fua = bio->bi_opf & REQ_FUA;
+	bool need_refill, low_free, ring_busy;
+	struct bio *clone = NULL;
 	unsigned int gc_tries = 0, mem_tries = 0;
 	blk_status_t err;
 
@@ -1424,10 +2684,42 @@ static int zns_handle_write(struct dm_target *ti, struct bio *bio)
 		goto err_out;
 	}
 
+	/* 메타 기록이 멈췄으면(fail-stop) 더 받지 않는다 — zns_write_done 참고 */
+	if (unlikely(READ_ONCE(c->md_err))) {
+		err = BLK_STS_IOERR;
+		goto err_out;
+	}
+
+	/*
+	 * FUA 쓰기는 자기 레코드가 커밋된 뒤에 완료해야 한다. 데이터는 복제본
+	 * 으로 보내고, 복제본이 끝나면 DM bio 를 커밋 워커에 넘긴다.
+	 */
+	if (fua) {
+		clone = zns_bio_clone(bio, GFP_NOIO, &c->fua_bs);
+		if (!clone) {
+			err = BLK_STS_RESOURCE;
+			goto err_out;
+		}
+	}
+
 	zns_admit(c, bio);
 
 again:
 	spin_lock_irqsave(&c->map_lock, flags);
+
+	/* 체크포인트 스냅샷 중이거나 레코드 링이 차면 커밋을 기다린다 */
+	if (c->frozen || zns_ring_used(c) + ZNS_RING_GC_HEADROOM >= c->ring_cap) {
+		c->commit_req = true;
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		queue_work(c->log_wq, &c->log_work);
+		wait_event(c->ring_wq, zns_may_alloc(c) ||
+			   READ_ONCE(c->crashed) || READ_ONCE(c->md_err));
+		if (READ_ONCE(c->crashed) || READ_ONCE(c->md_err)) {
+			err = BLK_STS_IOERR;
+			goto err_out;
+		}
+		goto again;
+	}
 
 	/* 인덱스 자리 확인 — 부분 갱신 방지를 위해 통째로 미리 */
 	if (c->node_used + nr_blocks > NODE_POOL_MAX &&
@@ -1462,7 +2754,7 @@ again:
 		 */
 		if (gc_tries >= WRITE_GC_RETRIES) {
 			DMERR_LIMIT("out of space: no reclaimable zone (valid data ~%u zones)",
-				    c->nr_zones - c->free_zones);
+				    c->data_zones - c->free_zones);
 			err = BLK_STS_NOSPC;
 			goto err_out;
 		}
@@ -1506,32 +2798,54 @@ again:
 	 * 제출 대기열에 넣는다 — 할당과 같은 락 구간이라 목록 순서 = 할당 순서.
 	 * 락을 푸는 순간 워커가 제출하고 완료까지 갈 수 있으므로, bio 와 pio 는
 	 * 여기서 전부 채우고 이후로는 건드리지 않는다.
+	 *
+	 * 매핑 레코드와 epoch 도 같은 구간에서 붙인다. 커밋은 이 쓰기가 끝난
+	 * 뒤에야 이 레코드를 기록한다.
 	 */
-	pio->zidx  = (int)zidx_of(c, pba);
-	pio->write = true;
-	pio->bytes = (unsigned int)(len_sectors << SECTOR_SHIFT);
+	pio->c       = c;
+	pio->zidx    = (int)zidx_of(c, pba);
+	pio->write   = true;
+	pio->fua     = fua;
+	pio->bytes   = (unsigned int)(len_sectors << SECTOR_SHIFT);
+	pio->rec_seq = zns_rec_append_locked(c, block_idx, pba, nr_blocks);
+	pio->epoch   = (u8)(c->epoch & 1);
+	atomic_inc(&c->ep_inflight[pio->epoch]);
 	atomic_inc(&c->zones[pio->zidx].wr_inflight);
 	atomic64_add(pio->bytes, &c->queued_bytes);
+	ring_busy = zns_ring_used(c) > c->ring_cap / 2;
+	if (ring_busy)
+		c->commit_req = true;
 
-	bio_set_dev(bio, c->dev->bdev);
-	bio->bi_iter.bi_sector = pba;
+	if (clone) {
+		bio_set_dev(clone, c->dev->bdev);
+		clone->bi_iter.bi_sector = pba;
+		/* 내구성은 커밋이 맡는다. 5.15 에서 FUA 는 zone 순서도 깨뜨린다. */
+		clone->bi_opf &= ~(REQ_FUA | REQ_PREFLUSH);
+		clone->bi_ioprio = 0;
+		clone->bi_end_io = zns_fua_child_endio;
+		clone->bi_private = bio;
+		bio_list_add(&c->sub_list, clone);
+	} else {
+		bio_set_dev(bio, c->dev->bdev);
+		bio->bi_iter.bi_sector = pba;
 #if ZNS_SCHED_ZONE_LOCK
-	/*
-	 * 5.15 의 mq-deadline 이 zone 순서를 지키는 것은 같은 우선순위 큐 안에서
-	 * 뿐이다. 우선순위가 섞이면(ionice, prioclass) 높은 쪽이 먼저 나가고,
-	 * FUA 쓰기는 스케줄러를 우회한다. 위쪽이 write-through 라 FUA 는 정상이라면
-	 * 붙어 오지 않는다.
-	 */
-	bio->bi_opf &= ~(REQ_FUA | REQ_PREFLUSH);
-	bio->bi_ioprio = 0;
+		/*
+		 * 5.15 의 mq-deadline 이 zone 순서를 지키는 것은 같은 우선순위 큐
+		 * 안에서뿐이다. 우선순위가 섞이면(ionice, prioclass) 높은 쪽이 먼저
+		 * 나간다.
+		 */
+		bio->bi_ioprio = 0;
 #endif
-	bio_list_add(&c->sub_list, bio);
+		bio_list_add(&c->sub_list, bio);
+	}
 
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
 	queue_work(c->sub_wq, &c->sub_work);
 
 	/* sleepable 뒷정리 — 제출을 늦추지 않도록 큐에 넣은 뒤에 */
+	if (ring_busy)
+		queue_work(c->log_wq, &c->log_work);
 	if (need_refill)
 		zns_refill_spares(c);
 	if (low_free)
@@ -1541,18 +2855,84 @@ again:
 	return DM_MAPIO_SUBMITTED;
 
 err_out:
+	if (clone)
+		bio_put(clone);
 	bio->bi_status = err;
 	bio_endio(bio);
 	return DM_MAPIO_SUBMITTED;
 }
 
 /*
- * 모든 bio 의 완료가 여기를 지난다. .map 이 zone 에 걸어 둔 것만 되돌린다.
+ * 쓰기 하나가 끝났을 때의 뒷정리 (DM bio 의 .end_io 또는 FUA 복제본의 완료).
  *
  * 쓰기가 거절되면 그 zone 의 하위 wp 는 우리 할당 위치와 어긋난다. 그대로
  * 두면 그 zone 의 이후 쓰기가 전부 거절되므로 활성 zone 이면 바로 마감한다.
  * 마감을 inflight 감소보다 먼저 해야, 그 사이에 zone 이 비워지고 다시 열린
- * 뒤 엉뚱한 zone 을 마감하는 일이 없다.
+ * 뒤 엉뚱한 zone 을 마감하는 일이 없다. 레코드의 VOID 표시도 epoch 감소보다
+ * 먼저다 — 감소 뒤에는 커밋이 이 레코드를 읽을 수 있다.
+ *
+ * 데이터 쓰기가 실패하면 메타 기록을 멈춘다(fail-stop). 실패한 쓰기의
+ * 메모리 매핑은 쓰이지 않은 위치를 가리키고 옛 위치의 valid 는 이미 줄었다.
+ * 그대로 커밋·체크포인트·GC reset 을 이어 가면 장치의 매핑이 쓰이지 않은
+ * 위치나 reset 된 zone 을 가리키게 된다. 멈추면 장치의 매핑은 마지막 커밋에
+ * 머물러 일관적이고, 이후 쓰기와 flush 는 EIO 다. md_err 도 epoch 감소보다
+ * 먼저 세운다 — 진행 중인 커밋이 대기에서 깨어나 이것을 본다.
+ */
+static void zns_write_done(struct zns_base_c *c, struct zns_pio *pio,
+			   blk_status_t error)
+{
+	struct zns_zone *z = &c->zones[pio->zidx];
+	unsigned long flags;
+
+	if (error) {
+		spin_lock_irqsave(&c->map_lock, flags);
+		c->stat_write_err++;
+		c->ring[pio->rec_seq & (c->ring_cap - 1)].flags |= ZNS_REC_VOID;
+		if (c->active_user_idx == pio->zidx) {
+			z->state = ZNS_ZONE_FULL;
+			c->active_user_idx = -1;
+		}
+		WRITE_ONCE(c->md_err, true);
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		wake_up_all(&c->ring_wq);
+		DMERR_LIMIT("write error %d in zone %d: metadata frozen at the last commit, writes and flushes will fail",
+			    blk_status_to_errno(error), pio->zidx);
+	}
+	atomic64_sub(pio->bytes, &c->queued_bytes);
+	wake_up(&c->admit_wq);
+	if (atomic_dec_and_test(&z->wr_inflight))
+		wake_up_all(&c->idle_wq);
+	if (atomic_dec_and_test(&c->ep_inflight[pio->epoch]))
+		wake_up_all(&c->ep_wq);
+	pio->zidx = -1;
+}
+
+/* FUA 쓰기의 데이터가 끝났다. 레코드가 커밋되면 커밋 워커가 DM bio 를 완료한다. */
+static void zns_fua_child_endio(struct bio *child)
+{
+	struct bio *bio = child->bi_private;
+	struct zns_pio *pio = zns_pio(bio);
+	struct zns_base_c *c = pio->c;
+	blk_status_t error = child->bi_status;
+	unsigned long flags;
+
+	zns_write_done(c, pio, error);
+	bio_put(child);
+
+	if (error) {
+		bio->bi_status = error;
+		bio_endio(bio);
+		return;
+	}
+	spin_lock_irqsave(&c->map_lock, flags);
+	bio_list_add(&c->fua_list, bio);
+	spin_unlock_irqrestore(&c->map_lock, flags);
+	queue_work(c->log_wq, &c->log_work);
+}
+
+/*
+ * 모든 bio 의 완료가 여기를 지난다. .map 이 zone 에 걸어 둔 것만 되돌린다.
+ * (FUA 쓰기는 복제본의 완료에서 이미 되돌려 zidx 가 -1 이다.)
  */
 static int zns_base_end_io(struct dm_target *ti, struct bio *bio,
 			   blk_status_t *error)
@@ -1560,28 +2940,14 @@ static int zns_base_end_io(struct dm_target *ti, struct bio *bio,
 	struct zns_base_c *c = ti->private;
 	struct zns_pio *pio  = zns_pio(bio);
 	struct zns_zone *z;
-	unsigned long flags;
 
 	if (pio->zidx < 0)
 		return DM_ENDIO_DONE;
 	z = &c->zones[pio->zidx];
 
 	if (pio->write) {
-		if (*error) {
-			spin_lock_irqsave(&c->map_lock, flags);
-			c->stat_write_err++;
-			if (c->active_user_idx == pio->zidx) {
-				z->state = ZNS_ZONE_FULL;
-				c->active_user_idx = -1;
-			}
-			spin_unlock_irqrestore(&c->map_lock, flags);
-			DMERR_LIMIT("write error %d in zone %d, zone sealed",
-				    blk_status_to_errno(*error), pio->zidx);
-		}
-		atomic64_sub(pio->bytes, &c->queued_bytes);
-		wake_up(&c->admit_wq);
-		if (atomic_dec_and_test(&z->wr_inflight))
-			wake_up_all(&c->idle_wq);
+		zns_write_done(c, pio, *error);
+		return DM_ENDIO_DONE;
 	} else {
 		if (atomic_dec_and_test(&z->rd_inflight))
 			wake_up_all(&c->idle_wq);
@@ -1667,12 +3033,22 @@ static int zns_handle_read(struct dm_target *ti, struct bio *bio)
 static int zns_base_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_base_c *c = ti->private;
+	unsigned long flags;
 
 	zns_pio(bio)->zidx = -1;	/* .end_io 가 되돌릴 것이 없음 */
 
+	/* crash 흉내 뒤에는 전원이 나간 장치처럼 아무것도 받지 않는다 */
+	if (unlikely(READ_ONCE(c->crashed)))
+		return DM_MAPIO_KILL;
+
 	if (bio->bi_opf & REQ_PREFLUSH) {
-		bio_set_dev(bio, c->dev->bdev);
-		return DM_MAPIO_REMAPPED;
+		/* DM 이 데이터와 떼어 빈 flush 로 보낸다. 커밋 뒤에 완료한다. */
+		WARN_ON_ONCE(bio_sectors(bio));
+		spin_lock_irqsave(&c->map_lock, flags);
+		bio_list_add(&c->flush_list, bio);
+		spin_unlock_irqrestore(&c->map_lock, flags);
+		queue_work(c->log_wq, &c->log_work);
+		return DM_MAPIO_SUBMITTED;
 	}
 
 	switch (bio_op(bio)) {
@@ -1723,18 +3099,29 @@ static int zns_base_iterate_devices(struct dm_target *ti,
  * status / message
  *
  *   $ dmsetup status X
- *   0 <len> zns-base <used> <total> <free_zones> <nr_zones> <valid_blk>
+ *   0 <len> zns-base <used> <total> <free_zones> <data_zones> <valid_blk>
  *                    <gc_runs> <migrated> <mem_n> <nr_runs> <flushes>
  *                    <compactions> <dropped>
  *                    <write_err> <order_viol> <queued_kib>
+ *                    <md_gen> <md_zone> <log_blocks> <commits> <ckpts>
+ *                    <pending_recs> <index_kib> <ring_kib> <recover_ms>
+ *                    <state>
  *
- *   used: FREE 가 아닌 zone 의 점유 섹터 합 (FULL 은 zone 통째,
- *         ACTIVE 는 wp 까지). GC 가 zone 을 회수하면 줄어든다.
+ *   used/total: 데이터 zone 의 점유 / 전체 섹터 (FULL 은 zone 통째, ACTIVE
+ *         는 wp 까지). GC 가 zone 을 회수하면 used 가 줄어든다.
  *   write_err: 하위가 거절한 사용자 쓰기.  order_viol: 0 이어야 한다.
  *   queued_kib: 할당됐지만 아직 완료되지 않은 사용자 쓰기.
+ *   log_blocks: 마지막 체크포인트 뒤 로그 블록.  pending_recs: 커밋 전 레코드.
+ *   index_kib: 매핑 인덱스 메모리 (MemTable 풀 + run 배열).
+ *   recover_ms: 생성 때 복구에 걸린 시간 (format 이면 0).
+ *   state: 0 정상, 1 crash 흉내 뒤, 2 fail-stop (쓰기 또는 메타 기록 실패).
  *
  *   $ dmsetup message X 0 gc <zone|auto>   — GC 강제 실행 (테스트용)
  *   $ dmsetup message X 0 zones            — zone 별 state:valid 덤프
+ *   $ dmsetup message X 0 commit           — 커밋
+ *   $ dmsetup message X 0 checkpoint       — 체크포인트 강제
+ *   $ dmsetup message X 0 crash            — 전원 차단 흉내: 이후 I/O 와
+ *                                            커밋을 모두 버린다
  * ================================================================== */
 
 static void zns_base_status(struct dm_target *ti, status_type_t type,
@@ -1745,14 +3132,15 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 	unsigned int sz = 0;
 	unsigned long flags;
 	sector_t used = 0;
-	u64 valid = 0;
+	u64 valid = 0, index_bytes, pending;
 	unsigned int i, mem_n, nr_runs, free_zones;
 	u64 fl, cp, dr, gc, mig, werr, oviol;
+	struct zns_run *r;
 
 	switch (type) {
 	case STATUSTYPE_INFO:
 		spin_lock_irqsave(&c->map_lock, flags);
-		for (i = 0; i < c->nr_zones; i++) {
+		for (i = 0; i < c->data_zones; i++) {
 			struct zns_zone *z = &c->zones[i];
 
 			if (z->state == ZNS_ZONE_FULL)
@@ -1761,6 +3149,12 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 				used += z->wp - z->start;
 			valid += z->valid;
 		}
+		index_bytes = (u64)NODE_POOL_MAX * sizeof(struct zns_mnode);
+		if (c->spare)
+			index_bytes += (u64)NODE_POOL_MAX * sizeof(struct zns_ent);
+		list_for_each_entry(r, &c->runs, list)
+			index_bytes += (u64)r->cap * sizeof(struct zns_ent);
+		pending = zns_ring_used(c);
 		free_zones = c->free_zones;
 		mem_n = c->mem_n;
 		nr_runs = c->nr_runs;
@@ -1775,8 +3169,8 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 
 		DMEMIT("%llu %llu %u %u %llu %llu %llu %u %u %llu %llu %llu %llu %llu %llu",
 		       (unsigned long long)used,
-		       (unsigned long long)c->total_sectors,
-		       free_zones, c->nr_zones,
+		       (unsigned long long)c->data_zones * c->zone_sectors,
+		       free_zones, c->data_zones,
 		       (unsigned long long)valid,
 		       (unsigned long long)gc,
 		       (unsigned long long)mig,
@@ -1787,6 +3181,18 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		       (unsigned long long)werr,
 		       (unsigned long long)oviol,
 		       (unsigned long long)(atomic64_read(&c->queued_bytes) >> 10));
+		/* md_* 는 log_lock 소관이지만 통계라 느슨하게 읽는다 */
+		DMEMIT(" %llu %u %u %llu %llu %llu %llu %llu %llu %d",
+		       (unsigned long long)READ_ONCE(c->md_gen),
+		       zns_md_zone(c, READ_ONCE(c->md_cur)),
+		       READ_ONCE(c->md_log_blocks),
+		       (unsigned long long)READ_ONCE(c->stat_commits),
+		       (unsigned long long)READ_ONCE(c->stat_ckpts),
+		       (unsigned long long)pending,
+		       (unsigned long long)(index_bytes >> 10),
+		       (unsigned long long)((c->ring_cap * sizeof(struct zns_rec)) >> 10),
+		       (unsigned long long)c->recover_ms,
+		       READ_ONCE(c->crashed) ? 1 : READ_ONCE(c->md_err) ? 2 : 0);
 		break;
 	case STATUSTYPE_TABLE:
 		DMEMIT("%s", c->dev->name);
@@ -1820,13 +3226,35 @@ static int zns_base_message(struct dm_target *ti, unsigned int argc,
 	}
 
 	if (argc == 1 && !strcmp(argv[0], "zones")) {
-		static const char st[3] = { 'F', 'A', 'U' }; /* Free/Active/fUll */
+		/* Free/Active/fUll/Meta */
+		static const char st[4] = { 'F', 'A', 'U', 'M' };
 
 		spin_lock_irqsave(&c->map_lock, flags);
 		for (i = 0; i < c->nr_zones && sz + 16 < maxlen; i++)
 			DMEMIT("%u:%c:%u ", i, st[c->zones[i].state],
 			       c->zones[i].valid);
 		spin_unlock_irqrestore(&c->map_lock, flags);
+		return 1;
+	}
+
+	if (argc == 1 && (!strcmp(argv[0], "commit") ||
+			  !strcmp(argv[0], "checkpoint"))) {
+		ret = zns_log_commit(c, argv[0][1] == 'h');
+		DMEMIT("%s -> %d", argv[0], ret);
+		return 1;
+	}
+
+	if (argc == 1 && !strcmp(argv[0], "crash")) {
+		/*
+		 * 전원 차단 흉내. 커밋되지 않은 매핑 변경은 사라지고, 이미 보낸
+		 * 쓰기는 장치에 닿을 수도 있다 — 실제 전원 차단과 같다. 기다리던
+		 * flush/FUA 는 실패로 끝낸다.
+		 */
+		WRITE_ONCE(c->crashed, true);
+		wake_up_all(&c->ring_wq);
+		queue_work(c->log_wq, &c->log_work);
+		DMWARN("crash: metadata commits stopped, all I/O will fail");
+		DMEMIT("crash -> 0");
 		return 1;
 	}
 
@@ -1839,7 +3267,7 @@ static int zns_base_message(struct dm_target *ti, unsigned int argc,
 
 static struct target_type zns_base_target = {
 	.name            = "zns-base",
-	.version         = {0, 5, 0},
+	.version         = {0, 6, 0},
 	/*
 	 * zoned 하위 장치를 받되 위쪽은 zoned 가 아니다(io_hints 가 지운다).
 	 * 이 플래그가 없으면 DM 이 zoned 모델 불일치로 테이블을 거부한다.
@@ -1863,7 +3291,7 @@ static int __init zns_base_init(void)
 	if (ret < 0)
 		DMERR("target registration failed: %d", ret);
 	else
-		DMINFO("target registered (LSM index + GC)");
+		DMINFO("target registered (LSM index + GC + metadata log)");
 	return ret;
 }
 
@@ -1876,6 +3304,6 @@ static void __exit zns_base_exit(void)
 module_init(zns_base_init);
 module_exit(zns_base_exit);
 
-MODULE_DESCRIPTION("ZNS target: random-to-sequential translation, LSM mapping, GC");
+MODULE_DESCRIPTION("ZNS target: random-to-sequential translation, LSM mapping, GC, crash recovery");
 MODULE_AUTHOR("SPLAB");
 MODULE_LICENSE("GPL");

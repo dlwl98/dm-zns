@@ -69,6 +69,27 @@ static inline void zns_submit_remapped(struct bio *bio)
 #endif
 }
 
+/* 데이터 페이지를 공유하는 복제본. 원본 DM bio 는 복제본이 끝날 때까지 산다. */
+static inline struct bio *zns_bio_clone(struct bio *bio, gfp_t gfp,
+					struct bio_set *bs)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+	return bio_clone_fast(bio, gfp, bs);
+#else
+	return bio_alloc_clone(bio->bi_bdev, bio, gfp, bs);
+#endif
+}
+
+/* DM bio 대신 타깃이 만든 복제본을 하위로 보낸다 */
+static inline void zns_submit_clone(struct bio *dm_bio, struct bio *clone)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+	submit_bio_noacct(clone);
+#else
+	dm_submit_bio_remap(dm_bio, clone);
+#endif
+}
+
 /*
  * zone reset. GC 는 쓰기 진행이 걸린 경로라 reclaim 이 I/O 를 내면 안 된다.
  * 6.9+ 는 gfp 인자가 없어지고 내부에서 GFP_KERNEL 로 할당하므로 scope API 로

@@ -66,8 +66,8 @@ zns_stat() {
 #
 # UNDERLYING 이 null_blk(nullb*) 이면 configfs 로 만들고 지운다.
 # 그 외 실제 zoned 장치(예: /dev/nvme0n1)는 host-managed 인지 확인하고
-# I/O 스케줄러만 맞춘다. dm 타깃 ctr 가 전체 zone 을 reset 하므로 남은
-# 데이터는 상관없다.
+# I/O 스케줄러만 맞춘다. 타깃을 format 으로 만들면 전체 zone 을 reset
+# 하므로 남은 데이터는 상관없다.
 #
 #   null_blk:  sudo bash scripts/phase1-verify.sh
 #   실제 장치: sudo UNDERLYING=/dev/nvme0n1 bash scripts/phase1-verify.sh
@@ -110,15 +110,45 @@ zns_under_down() {
 	bash scripts/nullblk-down.sh
 }
 
-# 하위 장치의 zone 크기 / 용량 (MiB)
-zns_zone_mb() { echo $(( $(cat "/sys/block/$(basename "$UNDERLYING")/queue/chunk_sectors") / 2048 )); }
-zns_cap_mb()  { echo $(( $(blockdev --getsz "$UNDERLYING") / 2048 )); }
+# 노출(논리) 크기, 섹터. ctr 의 over-provisioning 검사와 같은 식이다:
+#   데이터 zone = 전체 - 메타 2, 풀 = 데이터 - 활성 2,
+#   노출 ≤ 풀 × zone × ZNS_MAX_UTIL/1000 (기본 750)
+zns_logical_sectors() {
+	local under=${1:-${UNDERLYING:-/dev/nullb0}}
+	local util=${ZNS_MAX_UTIL:-750}
+	local zs nz
 
+	zs=$(cat "/sys/block/$(basename "$under")/queue/chunk_sectors") || return 1
+	nz=$(( $(blockdev --getsz "$under") / zs ))
+	echo $(( (nz - 4) * (zs / 8) * util / 1000 * 8 ))
+}
+
+# dm 테이블 한 줄.  zns_table <하위 장치> [format]
+zns_table() {
+	local under=$1
+	shift
+	local extra=""
+
+	[ -n "${ZNS_MAX_UTIL:-}" ] && extra=" max_util:$ZNS_MAX_UTIL"
+	echo "0 $(zns_logical_sectors "$under") zns-base $under$extra${1:+ $1}"
+}
+
+# 하위 장치의 zone 크기 / 노출 용량 (MiB)
+zns_zone_mb() { echo $(( $(cat "/sys/block/$(basename "$UNDERLYING")/queue/chunk_sectors") / 2048 )); }
+zns_cap_mb()  { echo $(( $(zns_logical_sectors "$UNDERLYING") / 2048 )); }
+
+# 새 타깃 (장치를 지우고 시작)
 zns_create_target() {
 	local name=${1:-my-m1-device}
 	local under=${2:-/dev/nullb0}
-	local sectors
 
-	sectors=$(blockdev --getsz "$under") || return 1
-	echo "0 $sectors zns-base $under" | dmsetup create "$name"
+	zns_table "$under" format | dmsetup create "$name"
+}
+
+# 기존 메타데이터에서 복구해 다시 만든다
+zns_reopen_target() {
+	local name=${1:-my-m1-device}
+	local under=${2:-/dev/nullb0}
+
+	zns_table "$under" | dmsetup create "$name"
 }

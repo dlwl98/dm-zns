@@ -4,8 +4,8 @@
 #
 #   T1  큰 읽기 == 작은 읽기      (멀티블록 read 매핑)
 #   T2  fio --verify=crc32c       (쓰기→읽기 왕복 무결성)
-#   T3  타깃 재생성               (ctr 의 zone reset)
-#   T4  용량 경계                 (끝을 넘기면 ENOSPC)
+#   T3  타깃 재생성               (메타데이터에서 복구 — 데이터가 남는가)
+#   T4  노출 용량 끝까지          (OP 덕에 ENOSPC 없이 두 번 채워지는가)
 #
 # 사용:  sudo bash scripts/phase2-verify.sh
 set -uo pipefail
@@ -38,9 +38,11 @@ teardown() {
 }
 
 create_target() {
-	local sectors
-	sectors=$(blockdev --getsz "$UNDERLYING")
-	echo "0 $sectors zns-base $UNDERLYING" | dmsetup create "$DM_NAME"
+	zns_table "$UNDERLYING" format | dmsetup create "$DM_NAME"
+}
+
+reopen_target() {
+	zns_table "$UNDERLYING" | dmsetup create "$DM_NAME"
 }
 
 step "0. 환경 구성"
@@ -94,64 +96,67 @@ else
 fi
 
 # =====================================================================
-# T3 — ctr 의 zone reset
+# T3 — 타깃 재생성 = 메타데이터 복구
 #
-# nullb0 는 그대로 둔 채 dm 타깃만 지웠다 다시 만든다. reset 이 없으면
-# 모듈의 wp_offset(0) 과 하위의 실제 wp 가 어긋나 첫 쓰기부터 거절당한다.
+# 하위 장치는 그대로 둔 채 dm 타깃만 지웠다 format 없이 다시 만든다.
+# ctr 가 메타 zone 에서 매핑을 되살리므로 T2 에서 쓴 데이터가 그대로 읽혀야
+# 하고, 하위 wp 에서 이어 쓰므로 새 쓰기도 거절되지 않아야 한다.
 # =====================================================================
-step "T3. nullb0 를 살려둔 채 타깃만 재생성"
+step "T3. 하위 장치를 살려둔 채 타깃만 재생성 (복구)"
 
 dmsetup remove "$DM_NAME" || bad "dmsetup remove 실패"
-create_target || { bad "타깃 재생성 실패"; dmesg | tail -5; }
+reopen_target || { bad "타깃 재생성 실패"; dmesg | tail -5; }
+dmesg | grep "zns-base: recover:" | tail -1 | sed 's/^.*zns-base: /  /'
 
-before=$(dmesg | grep -c blk_update_request)
-dd if=/dev/urandom of="$DEV" bs=4k count=256 oflag=direct status=none 2>"$T/recreate.txt"
-rc=$?
-after=$(dmesg | grep -c blk_update_request)
-
-if [ $rc -eq 0 ] && [ $((after - before)) -eq 0 ]; then
-	ok "재생성 후 쓰기 정상 (delta 0) — zone reset 이 먹었다"
+if fio --name=vfy --filename="$DEV" --rw=randwrite --bs=4k --size=32M \
+       --ioengine=libaio --iodepth=16 --direct=1 \
+       --verify=crc32c --verify_only=1 --verify_fatal=1 \
+       --minimal >"$T/reopen-verify.txt" 2>&1; then
+	ok "재생성 뒤 T2 데이터가 그대로 읽힘 — 매핑 복구"
 else
-	bad "재생성 후 쓰기 실패 (rc=$rc, delta=$((after-before)))"
-	dmesg | grep blk_update_request | tail -3
+	bad "재생성 뒤 T2 데이터 검증 실패"
+	grep -iE "verify|error|bad" "$T/reopen-verify.txt" | head -5
+fi
+
+if dd if=/dev/urandom of="$DEV" bs=4k count=256 oflag=direct status=none 2>"$T/recreate.txt"; then
+	ok "재생성 뒤 새 쓰기 정상 — 하위 wp 에서 이어 씀"
+else
+	bad "재생성 뒤 쓰기 실패"
+	cat "$T/recreate.txt"
 fi
 
 # =====================================================================
-# T4 — 용량 경계
+# T4 — 노출 용량 끝까지, 두 번
 #     디바이스를 끝까지 채우므로 반드시 마지막에.
 #
-# 노출 용량 = 물리 용량이라, 끝에 닿으면 GC 가 거의 꽉 찬 zone 을 옮기기만
-# 하고 공간을 못 만든다. 쓰기 하나가 GC 를 WRITE_GC_RETRIES 번 기다린 뒤
-# ENOSPC 가 되고, fio 는 continue_on_error 로 남은 쓰기를 계속 낸다.
-# zone 이 작고 I/O 가 빠르면(null_blk) 수 초에 끝나지만, zone 이 크고 GC 가
-# 느린 장치에서는 끝나지 않는다 — P2_T4=0 으로 건너뛴다.
+# 노출 용량이 데이터 풀의 3/4 이하라(over-provisioning) GC 가 고르는 zone
+# 에는 늘 비울 자리가 있다. 노출 용량 전체를 두 번 써도 ENOSPC 가 없어야
+# 한다. 두 번째는 첫 번째를 전부 덮어써 GC 를 돌린다.
 # =====================================================================
-step "T4. 용량을 넘기면 조용히 새지 않고 끊기는가"
+step "T4. 노출 용량 전체를 두 번 써도 공간이 막히지 않는가"
 
 if [ "${P2_T4:-1}" = 0 ]; then
 	echo "  [SKIP] P2_T4=0"
 else
-CAP_MB=$(( $(blockdev --getsz "$UNDERLYING") / 2048 ))
-echo "  디바이스 용량 ${CAP_MB} MiB — 넘겨서 써 본다"
+CAP_MB=$(( $(blockdev --getsz "$DEV") / 2048 ))
+echo "  노출 용량 ${CAP_MB} MiB (하위 $(( $(blockdev --getsz "$UNDERLYING") / 2048 )) MiB)"
 
 before_oos=$(dmesg | grep -c "zns-base.*out of space")
-before_blk=$(dmesg | grep -c blk_update_request)
-
-fio --name=fill --filename="$DEV" --rw=write --bs=1M \
-    --size=${CAP_MB}M --ioengine=libaio --iodepth=8 --direct=1 \
-    --continue_on_error=all --minimal >"$T/fill.txt" 2>&1
-
+t0=$(date +%s)
+rc=0
+for pass in 1 2; do
+	fio --name=fill$pass --filename="$DEV" --rw=write --bs=1M \
+	    --size=${CAP_MB}M --ioengine=libaio --iodepth=8 --direct=1 \
+	    --minimal >"$T/fill$pass.txt" 2>&1 || rc=1
+done
 after_oos=$(dmesg | grep -c "zns-base.*out of space")
-after_blk=$(dmesg | grep -c blk_update_request)
+echo "  두 번 채우기 $(( $(date +%s) - t0 ))s, GC $(zns_stat 9 "$DM_NAME")회"
 
-echo "  out-of-space 로그 증가:      $((after_oos - before_oos))"
-echo "  blk_update_request 증가:     $((after_blk - before_blk))"
-
-if [ $((after_oos - before_oos)) -gt 0 ]; then
-	ok "경계에서 ENOSPC 로 끊었다 (의도된 동작)"
-	dmesg | grep "zns-base.*out of space" | tail -1 | sed 's/^/         /'
+if [ $rc -eq 0 ] && [ $((after_oos - before_oos)) -eq 0 ]; then
+	ok "노출 용량 끝까지 두 번 — ENOSPC 없음"
 else
-	bad "경계 검사가 걸리지 않았다"
+	bad "채우기 실패 (rc=$rc, out-of-space 로그 $((after_oos - before_oos)))"
+	grep -iE "error|no space" "$T"/fill*.txt | head -3
 fi
 fi
 
