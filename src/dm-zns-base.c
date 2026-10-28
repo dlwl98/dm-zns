@@ -371,6 +371,11 @@ struct zns_base_c {
 	u64	stat_ckpts;
 	u64	stat_log_blocks;
 	u64	recover_ms;
+	/* 비용 (누적) */
+	u64	stat_gc_ns;		/* 회수에 성공한 GC 의 경과 시간 합 */
+	u64	stat_compact_ns;	/* 컴팩션 병합 시간 합 */
+	u64	stat_compact_ents;	/* 컴팩션이 읽은 항목 수 합 */
+	u64	stat_ckpt_ns;		/* 체크포인트 시간 합 */
 	u64	stat_flushes;
 	u64	stat_compactions;
 	u64	stat_dropped;	/* 인덱스에서 제거된 중복 엔트리 수 */
@@ -719,7 +724,7 @@ static bool zns_compact_step(struct zns_base_c *c)
 	struct list_head *anchor;
 	unsigned int cap, k = 0, i, n = 0;
 	unsigned long flags;
-	u64 dropped = 0, sum = 0;
+	u64 dropped = 0, sum = 0, t0;
 	bool force;
 
 	spin_lock_irqsave(&c->map_lock, flags);
@@ -766,6 +771,7 @@ static bool zns_compact_step(struct zns_base_c *c)
 		goto out_abort;
 
 	/* 할당이 안 되면 가장 오래된 것부터 빼며 더 작게 병합한다 */
+	t0 = ktime_get_ns();
 	for (ents = NULL; k >= 2; k--) {
 		ents = zns_merge_runs(snap, k, &n, &dropped);
 		if (ents)
@@ -794,6 +800,8 @@ static bool zns_compact_step(struct zns_base_c *c)
 	c->nr_runs++;
 	c->stat_compactions++;
 	c->stat_dropped += dropped;
+	c->stat_compact_ns += ktime_get_ns() - t0;
+	c->stat_compact_ents += merged->cap;
 	c->compacting = false;
 	spin_unlock_irqrestore(&c->map_lock, flags);
 	wake_up_all(&c->compact_done);
@@ -1192,7 +1200,7 @@ static int zns_checkpoint(struct zns_base_c *c, u64 *boundary)
 	struct rb_node *node;
 	unsigned long flags;
 	unsigned int k = 0, kmax, n = 0, mn = 0;
-	u64 total = 0, dropped, b;
+	u64 total = 0, dropped, b, t0 = ktime_get_ns();
 	int ret = 0;
 
 	mem    = zns_kvmalloc_array(NODE_POOL_MAX, sizeof(*mem), GFP_NOIO);
@@ -1286,6 +1294,7 @@ static int zns_checkpoint(struct zns_base_c *c, u64 *boundary)
 	if (!ret) {
 		*boundary = b;
 		c->stat_ckpts++;
+		c->stat_ckpt_ns += ktime_get_ns() - t0;
 		DMINFO("checkpoint: gen %llu, %u mappings",
 		       (unsigned long long)c->md_gen, n);
 	}
@@ -1512,6 +1521,7 @@ static int zns_gc_once(struct zns_base_c *c, int want_victim)
 	unsigned int mem_n = 0, k = 0, kmax, ncand = 0, ci;
 	unsigned int max_cand;
 	int vidx, ret = 0, restarts = 0;
+	u64 t0 = ktime_get_ns();
 
 	/* ---- 스냅샷용 메모리 (락 밖 선할당) ---- */
 	max_cand = (unsigned int)(c->zone_sectors >> BLOCK_SHIFT);
@@ -1803,6 +1813,7 @@ do_reset:
 	victim->wp    = victim->start;
 	c->free_zones++;
 	c->stat_gc_runs++;
+	c->stat_gc_ns += ktime_get_ns() - t0;
 	spin_unlock_irqrestore(&c->map_lock, flags);
 
 	DMDEBUG("gc: reclaimed zone %d", vidx);
@@ -3105,7 +3116,7 @@ static int zns_base_iterate_devices(struct dm_target *ti,
  *                    <write_err> <order_viol> <queued_kib>
  *                    <md_gen> <md_zone> <log_blocks> <commits> <ckpts>
  *                    <pending_recs> <index_kib> <ring_kib> <recover_ms>
- *                    <state>
+ *                    <state> <gc_ms> <compact_ms> <compact_ents> <ckpt_ms>
  *
  *   used/total: 데이터 zone 의 점유 / 전체 섹터 (FULL 은 zone 통째, ACTIVE
  *         는 wp 까지). GC 가 zone 을 회수하면 used 가 줄어든다.
@@ -3115,6 +3126,8 @@ static int zns_base_iterate_devices(struct dm_target *ti,
  *   index_kib: 매핑 인덱스 메모리 (MemTable 풀 + run 배열).
  *   recover_ms: 생성 때 복구에 걸린 시간 (format 이면 0).
  *   state: 0 정상, 1 crash 흉내 뒤, 2 fail-stop (쓰기 또는 메타 기록 실패).
+ *   gc_ms / compact_ms / ckpt_ms: 회수에 성공한 GC, 컴팩션 병합, 체크포인트에
+ *         걸린 시간의 누적. compact_ents: 컴팩션이 읽은 항목 수의 누적.
  *
  *   $ dmsetup message X 0 gc <zone|auto>   — GC 강제 실행 (테스트용)
  *   $ dmsetup message X 0 zones            — zone 별 state:valid 덤프
@@ -3193,6 +3206,11 @@ static void zns_base_status(struct dm_target *ti, status_type_t type,
 		       (unsigned long long)((c->ring_cap * sizeof(struct zns_rec)) >> 10),
 		       (unsigned long long)c->recover_ms,
 		       READ_ONCE(c->crashed) ? 1 : READ_ONCE(c->md_err) ? 2 : 0);
+		DMEMIT(" %llu %llu %llu %llu",
+		       (unsigned long long)div_u64(READ_ONCE(c->stat_gc_ns), NSEC_PER_MSEC),
+		       (unsigned long long)div_u64(READ_ONCE(c->stat_compact_ns), NSEC_PER_MSEC),
+		       (unsigned long long)READ_ONCE(c->stat_compact_ents),
+		       (unsigned long long)div_u64(READ_ONCE(c->stat_ckpt_ns), NSEC_PER_MSEC));
 		break;
 	case STATUSTYPE_TABLE:
 		DMEMIT("%s", c->dev->name);
