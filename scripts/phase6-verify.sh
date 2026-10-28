@@ -226,7 +226,7 @@ step "T5. 복구 시간과 매핑 메모리"
 # =====================================================================
 CAP_MB=$(zns_cap_mb)
 SIZES=${P6_SIZES:-"$(( CAP_MB / 16 )) $(( CAP_MB / 4 )) $(( CAP_MB * 3 / 4 ))"}
-printf "  %-9s %-9s %-11s %-10s %-12s %-12s\n" "쓴 양" "로그블록" "인덱스KiB" "링KiB" "복구(로그)" "복구(체크)" | tee "$T/recovery.txt"
+printf "  %-9s %-9s %-11s %-10s %-12s %-12s %-12s\n" "쓴 양" "로그블록" "인덱스KiB" "링KiB" "복구(로그)" "체크포인트" "복구(체크)" | tee "$T/recovery.txt"
 for W in $SIZES; do
 	fresh || { echo "환경 구성 실패"; exit 1; }
 	fio --name=rnd --offset=0 --size=${W}M --rw=randwrite --bs=4k --iodepth=32 \
@@ -236,10 +236,11 @@ for W in $SIZES; do
 	reopen || { bad "${W} MiB: 복구 실패"; cat "$T/reopen.log"; continue; }
 	r_log=$(st 27)
 	dmsetup message "$DM_NAME" 0 checkpoint >/dev/null
+	ck=$(st 32)
 	dmsetup remove "$DM_NAME"
 	reopen || { bad "${W} MiB: 체크포인트 뒤 복구 실패"; cat "$T/reopen.log"; continue; }
 	r_ck=$(st 27)
-	printf "  %-9s %-9s %-11s %-10s %-12s %-12s\n" "${W}MiB" "$logb" "$idx" "$ring" "${r_log}ms" "${r_ck}ms" | tee -a "$T/recovery.txt"
+	printf "  %-9s %-9s %-11s %-10s %-12s %-12s %-12s\n" "${W}MiB" "$logb" "$idx" "$ring" "${r_log}ms" "${ck}ms" "${r_ck}ms" | tee -a "$T/recovery.txt"
 done
 ok "복구 시간 측정 완료 ($T/recovery.txt)"
 
