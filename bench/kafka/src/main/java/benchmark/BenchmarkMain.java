@@ -10,7 +10,6 @@ import java.util.concurrent.atomic.AtomicLong;
 public class BenchmarkMain {
 
     public static void main(String[] args) throws Exception {
-        // Parse arguments
         String bootstrapServers = getArg(args, "--bootstrap-server", "localhost:9092");
         String topic = getArg(args, "--topic", "perf-test");
         String mode = getArg(args, "--mode", "producer"); // "producer" or "both"
@@ -22,7 +21,7 @@ public class BenchmarkMain {
         int reportIntervalSec = Integer.parseInt(getArg(args, "--report-interval", "5"));
 
         long durationMs = durationSec * 1000L;
-        int maxRecords = opsPerSec * durationSec * 2; // 2x buffer for safety
+        int maxRecords = opsPerSec * durationSec * 2;
 
         System.out.println("=== Kafka Benchmark ===");
         System.out.printf("Mode: %s | Threads: %d | Target OP/s: %d%n", mode, threads, opsPerSec);
@@ -35,20 +34,18 @@ public class BenchmarkMain {
         AtomicLong totalConsumed = new AtomicLong(0);
         LatencyRecorder recorder = new LatencyRecorder(maxRecords);
 
-        // Thread count: producers only in latch (consumer stops via running flag)
         boolean withConsumer = mode.equals("both");
-        CountDownLatch latch = new CountDownLatch(threads); // Only producers
+        // Counts producers only; the consumer stops when running is cleared.
+        CountDownLatch latch = new CountDownLatch(threads);
         ExecutorService executor = Executors.newFixedThreadPool(threads + 2);
 
-        // Start consumer first (if Scenario B)
         if (withConsumer) {
             executor.submit(new BenchmarkConsumer(bootstrapServers, topic, running, totalConsumed,
-                new CountDownLatch(1))); // separate latch, not blocking main
-            Thread.sleep(2000); // Let consumer join group
+                new CountDownLatch(1)));
+            Thread.sleep(2000); // let the consumer join the group
             System.out.println("[Consumer] Started");
         }
 
-        // Start reporter thread
         executor.submit(() -> {
             try {
                 int lastIdx = 0;
@@ -87,7 +84,6 @@ public class BenchmarkMain {
             } catch (InterruptedException ignored) {}
         });
 
-        // Start producers
         long startTime = System.currentTimeMillis();
         for (int i = 0; i < threads; i++) {
             executor.submit(new BenchmarkProducer(i, bootstrapServers, topic,
@@ -95,15 +91,13 @@ public class BenchmarkMain {
         }
         System.out.printf("[Producer] Started %d threads%n", threads);
 
-        // Wait for completion
         latch.await();
         running.set(false);
         long totalTime = System.currentTimeMillis() - startTime;
 
-        Thread.sleep(500); // Let reporter finish
+        Thread.sleep(500); // let the reporter finish
         executor.shutdownNow();
 
-        // Final stats
         LatencyRecorder.Stats finalStats = recorder.calculate();
         long sent = totalSent.get();
         double avgOps = (double) sent / (totalTime / 1000.0);
@@ -118,7 +112,6 @@ public class BenchmarkMain {
             System.out.printf("Total consumed: %d records%n", totalConsumed.get());
         }
 
-        // Save CSV results
         String scenario = withConsumer ? "B" : "A";
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         String csvFile = String.format("%s/result_%s_%dKB_%dops_%s.csv",

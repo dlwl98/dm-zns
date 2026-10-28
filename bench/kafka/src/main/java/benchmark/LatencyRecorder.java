@@ -3,10 +3,7 @@ package benchmark;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Lock-free latency recorder with percentile calculation.
- * Pre-allocates array to avoid GC during benchmark.
- */
+/** Latencies go into a preallocated array, so recording does not allocate. */
 public class LatencyRecorder {
     private final long[] latencies;
     private final AtomicInteger count = new AtomicInteger(0);
@@ -48,7 +45,6 @@ public class LatencyRecorder {
         );
     }
 
-    /** Calculate stats for a window (from startIdx to current count) */
     public Stats calculateWindow(int startIdx) {
         int endIdx = getCount();
         int n = endIdx - startIdx;

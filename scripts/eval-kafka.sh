@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Kafka 벤치마크 (bench/kafka 의 Producer/Consumer) 를 세 구성 위에서 돌린다.
-#   Scenario A: Producer 4 스레드,  B: Producer 4 스레드 + Consumer 1
-#   record size 별 OP/s 단계를 차례로 올리고, 한 단계 DUR 초.
-#   목표 데이터량이 LIMIT_MB 를 넘는 단계는 건너뛴다 (F2FS 의 사용 가능 공간이 약 11 GiB).
-# root 로, 레포 루트에서:
+# 세 구성 위 Kafka. Scenario A 는 Producer 4 스레드, B 는 Consumer 1개를 더한다. 한 단계 DUR 초.
 #   sudo KAFKA=<Kafka 4.2.0 경로> DMZADM=<dmzadm 경로> bash scripts/eval-kafka.sh [OUT] [configs...]
 set -u
 OUT=${1:-results/kafka}
@@ -14,7 +10,7 @@ LIMIT_MB=${LIMIT_MB:-6144}
 . scripts/eval-common.sh
 mkdir -p "$OUT"
 
-steps() {	# record size → OP/s 단계
+steps() {
 	case $1 in
 	1024)    echo "1000 5000 10000 20000 50000" ;;
 	10240)   echo "500 1000 5000 10000" ;;
@@ -51,7 +47,6 @@ for cfg in $CONFIGS; do
 	ev_down
 done
 
-# 모든 결과 CSV 를 하나로
 {
 	echo "config,scenario,record_size_bytes,target_ops,actual_ops,throughput_mb_s,duration_sec,total_records,avg_ms,p50_ms,p90_ms,p99_ms,max_ms,consumed"
 	for cfg in $CONFIGS; do

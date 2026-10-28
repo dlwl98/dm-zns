@@ -371,11 +371,11 @@ struct zns_base_c {
 	u64	stat_ckpts;
 	u64	stat_log_blocks;
 	u64	recover_ms;
-	/* 비용 (누적) */
-	u64	stat_gc_ns;		/* 회수에 성공한 GC 의 경과 시간 합 */
-	u64	stat_compact_ns;	/* 컴팩션 병합 시간 합 */
-	u64	stat_compact_ents;	/* 컴팩션이 읽은 항목 수 합 */
-	u64	stat_ckpt_ns;		/* 체크포인트 시간 합 */
+	/* 누적 비용, status 의 gc_ms ~ ckpt_ms */
+	u64	stat_gc_ns;
+	u64	stat_compact_ns;
+	u64	stat_compact_ents;
+	u64	stat_ckpt_ns;
 	u64	stat_flushes;
 	u64	stat_compactions;
 	u64	stat_dropped;	/* 인덱스에서 제거된 중복 엔트리 수 */

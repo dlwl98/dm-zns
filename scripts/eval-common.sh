@@ -1,12 +1,6 @@
-# 평가 공통: 세 구성을 만들어 $MNT 에 마운트한다.  source 해서 쓴다 (root, 레포 루트에서).
-#   dmzns    ext4 on dm-zns            ZNS 단독
-#   dmzoned  ext4 on dm-zoned          ZNS + 일반 장치(루프 파일)
-#   f2fs     F2FS multi-device         ZNS + 일반 장치(루프 파일)
-# 일반 장치는 루트 디스크 위 루프 파일이다(REG_MB). F2FS 는 zone 이 크고 적으면(2 GiB × 16)
-# 예비 섹션이 커서, 일반 장치 16 GiB + 예비 비율 40% 에서 쓸 수 있는 공간이 약 11 GiB 다.
-#
-# 필요한 것: src/dm-zns-base.ko (make), dm-zoned-tools 의 dmzadm (DMZADM),
-#            f2fs-tools 1.14 이상, Kafka 4.2.0 (KAFKA), bench/kafka 빌드 (eval-kafka, eval-t6)
+# 평가 공통. ev_up 이 세 구성 중 하나를 만들어 $MNT 에 마운트한다. root 로, 레포 루트에서 source 한다.
+#   dmzns: ext4 on dm-zns, dmzoned: ext4 on dm-zoned, f2fs: F2FS multi-device
+#   dmzoned 와 f2fs 의 일반 장치는 루프 파일(REG_MB)이다.
 # shellcheck shell=bash
 ZDEV=${ZDEV:-/dev/nvme0n1}
 REG_MB=${REG_MB:-16384}
@@ -35,7 +29,6 @@ ev_down() {
 
 ev_mkext4() { mkfs.ext4 -q -F -E lazy_itable_init=0,lazy_journal_init=0 "$1"; }
 
-# ev_up <dmzns|dmzoned|f2fs>
 ev_up() {
 	ev_down
 	case $1 in
@@ -66,16 +59,14 @@ ev_up() {
 	echo 3 >/proc/sys/vm/drop_caches
 }
 
-# 노출(사용 가능) 크기, MiB
 ev_avail_mb() { df -BM --output=avail "$MNT" | tail -1 | tr -dc 0-9; }
 
-# ---- Kafka (KRaft standalone, 브로커 하나) ----
 KAFKA=${KAFKA:-/opt/kafka_2.13-4.2.0}
 BENCH=${BENCH:-bench/kafka}
 CP="$BENCH/kafka-benchmark.jar:$KAFKA/libs/*"
 export KAFKA_HEAP_OPTS=${KAFKA_HEAP_OPTS:-"-Xms2G -Xmx2G"}
 
-kafka_up() {	# kafka_up <log dir>   (KAFKA_EXTRA="a=b;c=d" 로 설정 추가)
+kafka_up() {	# kafka_up <log dir>, KAFKA_EXTRA="a=b;c=d" 는 설정에 덧붙인다
 	local cfg=/tmp/ev-kafka.properties id
 	if [ ! -x "$KAFKA/bin/kafka-server-start.sh" ] || [ ! -f "$BENCH/kafka-benchmark.jar" ]; then
 		echo "KAFKA=$KAFKA 또는 $BENCH/kafka-benchmark.jar 가 없습니다 (bench/kafka/build.sh)" >&2

@@ -65,7 +65,6 @@ public class BenchmarkProducer implements Runnable {
             while (running.get() && (System.currentTimeMillis() - startTime) < durationMs) {
                 long now = System.nanoTime();
                 if (now < nextSendNs) {
-                    // Busy-wait for precise timing (short sleeps for longer waits)
                     long waitNs = nextSendNs - now;
                     if (waitNs > 1_000_000) {
                         Thread.sleep(waitNs / 2_000_000);

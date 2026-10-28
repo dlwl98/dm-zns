@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# OP 비율별 WAF 와 GC·컴팩션 비용 (dm-zns 장치에 직접)
-#   max_util ∈ UTILS: 노출 용량을 100% 순차로 채운 뒤, 같은 영역에 노출 용량만큼 16K 무작위 덮어쓰기
-#   측정: 덮어쓰기 처리량, GC 횟수·이주 블록 → WAF, GC 한 번 평균 시간, 컴팩션 횟수·시간·항목, 체크포인트
-# root 로, 레포 루트에서:  sudo bash scripts/eval-op.sh [OUT]
+# max_util 별 WAF 와 GC·컴팩션·체크포인트 비용. 노출 용량을 채운 뒤 같은 양을 16K 임의 덮어쓰기 한다.
+#   sudo bash scripts/eval-op.sh [OUT]
 set -u
 OUT=${1:-results/op}
 UTILS=${UTILS:-"600 750 900"}

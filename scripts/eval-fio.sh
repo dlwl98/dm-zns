@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# fio 성능 비교: 세 구성(dmzns / dmzoned / f2fs) 위 파일 하나(SIZE)에
-#   seqwrite 1M QD8 → seqread 1M QD8 → randwrite 4K QD32 (60s) → randread 4K QD32 (30s)
-# 기준선: ZNS 장치에 직접 순차 쓰기/읽기 (zonemode=zbd).
-# root 로, 레포 루트에서:  sudo DMZADM=<dmzadm 경로> bash scripts/eval-fio.sh [OUT] [SIZE]
+# 세 구성과 ZNS 직접(기준선)의 fio 성능.
+#   sudo DMZADM=<dmzadm 경로> bash scripts/eval-fio.sh [OUT] [SIZE]
 set -u
 OUT=${1:-results/fio}
 SIZE=${2:-4G}
@@ -11,8 +9,7 @@ mkdir -p "$OUT"
 CSV=$OUT/fio.csv
 echo "config,job,bw_mib_s,iops,clat_p50_us,clat_p99_us" >"$CSV"
 
-# fio json 에서 쓰기/읽기 한쪽 값을 뽑는다
-emit() {	# emit <config> <job> <json>
+emit() {
 	python3 - "$1" "$2" "$3" >>"$CSV" <<'EOF'
 import json, sys
 cfg, job, path = sys.argv[1:4]
@@ -25,7 +22,7 @@ print(f"{cfg},{job},{side['bw']/1024:.1f},{side['iops']:.0f},{p50:.0f},{p99:.0f}
 EOF
 }
 
-run() {	# run <config> <job> <fio args...>
+run() {
 	local cfg=$1 job=$2
 	shift 2
 	sync; echo 3 >/proc/sys/vm/drop_caches

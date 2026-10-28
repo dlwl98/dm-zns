@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# T6: ext4 on dm-zns 위에서 Kafka 를 오래(기본 1시간) 돌린다.
-#   Producer 4 스레드 + Consumer 1, 10 KiB × 2000 op/s (약 20 MiB/s).
-#   retention 을 작게(파티션당 1 GiB, segment 128 MiB) 잡아 segment 삭제가 계속 일어나게 한다.
-#   discard 가 없으므로 ext4 가 지운 블록을 다시 쓰면서 dm-zns 의 GC 가 계속 돈다.
-#   끝나고: 지연 시간 추이, GC·WAF, 커널 경고(hung task 등), umount 후 e2fsck.
-# root 로, 레포 루트에서:  sudo KAFKA=<Kafka 4.2.0 경로> DURATION=3600 bash scripts/eval-t6.sh [OUT]
+# T6: ext4 on dm-zns 위 Kafka 장시간 부하. 보존 크기를 작게 잡아 segment 삭제와 GC 가 계속 일어나게 한다.
+#   sudo KAFKA=<Kafka 4.2.0 경로> DURATION=3600 bash scripts/eval-t6.sh [OUT]
 set -u
 OUT=${1:-results/t6}
 DURATION=${DURATION:-3600}
