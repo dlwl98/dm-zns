@@ -38,7 +38,8 @@ sudo bash scripts/test-basic.sh   # ALL CHECKS PASSED 까지
 ```
 dm-zns-base/
 ├── src/         커널 모듈 소스 + Makefile
-├── scripts/     nullblk 셋업, 자동 테스트
+├── scripts/     nullblk 셋업, 자동 테스트, 평가(eval-*.sh)
+├── bench/kafka/ 평가용 Kafka 부하 생성기 (Java)
 ├── docs/        셋업·마일스톤·참고자료
 ├── Vagrantfile  Windows용 자동 VM
 └── provision.sh

@@ -21,3 +21,8 @@ Module.symvers
 
 # local experiment scripts
 scripts/exp-*.sh
+
+# evaluation output and the built load generator
+results/
+bench/kafka/build/
+bench/kafka/*.jar
